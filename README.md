@@ -12,6 +12,9 @@ The first version provides:
 - Affiliate disclosure
 - `/id` command for setup
 - Owner-only `/testdeal` channel-post test
+- Guided searches with maximum-price and condition filters
+- Owner-only `/deal` creator for product links
+- Private deal preview with Publish and Reject buttons
 - HTTP health endpoint for Bunny Magic Containers
 - Secure environment-variable configuration
 
@@ -47,3 +50,10 @@ python bot.py
 5. Send `/testdeal` privately to the bot.
 
 The bot should publish a clearly marked test card in the channel.
+
+## Manual deal workflow
+
+Send `/deal` privately to the bot and follow the prompts for the retailer URL,
+product title, current price and optional previous price. DealHound produces a
+private preview. Nothing reaches the public channel until the owner presses
+**Publish**.
