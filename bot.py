@@ -1,7 +1,9 @@
 import logging
 import os
 import threading
+from html import escape
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import urlparse
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
@@ -87,7 +89,7 @@ async def show_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def find_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    context.user_data["awaiting_search"] = True
+    context.user_data["flow"] = "search_query"
     await update.effective_message.reply_text(
         "🔎 What would you like me to find?\n\n"
         "For example: `Samsung 55 inch TV under £600`",
@@ -96,7 +98,27 @@ async def find_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def demo_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not context.user_data.pop("awaiting_search", False):
+    flow = context.user_data.get("flow")
+
+    if flow == "deal_url":
+        await receive_deal_url(update, context)
+        return
+    if flow == "deal_title":
+        context.user_data["deal"]["title"] = update.effective_message.text.strip()
+        context.user_data["flow"] = "deal_price"
+        await update.effective_message.reply_text(
+            "💷 What is the current price?\n\nExample: `449.00`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    if flow == "deal_price":
+        await receive_deal_price(update, context)
+        return
+    if flow == "deal_old_price":
+        await receive_deal_old_price(update, context)
+        return
+
+    if flow != "search_query":
         await update.effective_message.reply_text(
             "Tap *Find a product* or use /find to start a search.",
             parse_mode=ParseMode.MARKDOWN,
@@ -105,6 +127,35 @@ async def demo_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     query = update.effective_message.text.strip()
+    context.user_data["search"] = {"query": query}
+    context.user_data["flow"] = "search_budget"
+    keyboard = InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("£50", callback_data="budget:50"),
+                InlineKeyboardButton("£100", callback_data="budget:100"),
+                InlineKeyboardButton("£250", callback_data="budget:250"),
+            ],
+            [
+                InlineKeyboardButton("£500", callback_data="budget:500"),
+                InlineKeyboardButton("£1,000", callback_data="budget:1000"),
+            ],
+            [InlineKeyboardButton("No maximum", callback_data="budget:any")],
+        ]
+    )
+    await update.effective_message.reply_text(
+        f"🐶 Searching for: *{escape_markdown(query)}*\n\n"
+        "What is your maximum price?",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=keyboard,
+    )
+
+
+async def send_demo_result(message, context: ContextTypes.DEFAULT_TYPE) -> None:
+    search = context.user_data.get("search", {})
+    query = search.get("query", "product")
+    budget = search.get("budget", "No maximum")
+    condition = search.get("condition", "Any")
     keyboard = InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("View example deal", url="https://www.ebay.co.uk/")],
@@ -112,9 +163,11 @@ async def demo_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
             [InlineKeyboardButton("🔎 Search again", callback_data="find")],
         ]
     )
-    await update.effective_message.reply_text(
+    await message.reply_text(
         "🐶 *DealHound searched for:*\n"
         f"`{escape_markdown(query)}`\n\n"
+        f"💷 Maximum: *{escape_markdown(str(budget))}*\n"
+        f"📦 Condition: *{escape_markdown(condition)}*\n\n"
         "🏷 *Example matching result*\n"
         "💷 £449.00\n"
         "🏪 eBay UK\n"
@@ -126,6 +179,7 @@ async def demo_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         reply_markup=keyboard,
         disable_web_page_preview=True,
     )
+    context.user_data.pop("flow", None)
 
 
 def escape_markdown(value: str) -> str:
@@ -137,12 +191,41 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await query.answer()
 
     if query.data == "find":
-        context.user_data["awaiting_search"] = True
+        context.user_data["flow"] = "search_query"
         await query.message.reply_text(
             "🔎 What would you like me to find?\n\n"
             "For example: `Air fryer under £100`",
             parse_mode=ParseMode.MARKDOWN,
         )
+    elif query.data.startswith("budget:"):
+        value = query.data.split(":", 1)[1]
+        context.user_data.setdefault("search", {})["budget"] = (
+            "No maximum" if value == "any" else f"£{int(value):,}"
+        )
+        context.user_data["flow"] = "search_condition"
+        keyboard = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton("New", callback_data="condition:new"),
+                    InlineKeyboardButton("Refurbished", callback_data="condition:refurbished"),
+                ],
+                [
+                    InlineKeyboardButton("Used", callback_data="condition:used"),
+                    InlineKeyboardButton("Any", callback_data="condition:any"),
+                ],
+            ]
+        )
+        await query.message.reply_text("Which condition?", reply_markup=keyboard)
+    elif query.data.startswith("condition:"):
+        value = query.data.split(":", 1)[1]
+        context.user_data.setdefault("search", {})["condition"] = value.title()
+        await send_demo_result(query.message, context)
+    elif query.data == "deal_approve":
+        await approve_deal(query, context)
+    elif query.data == "deal_reject":
+        context.user_data.pop("deal", None)
+        context.user_data.pop("flow", None)
+        await query.edit_message_text("❌ Deal rejected. Nothing was published.")
     elif query.data == "deals":
         await query.message.reply_text(
             "🔥 *Today's deals*\n\n"
@@ -223,6 +306,147 @@ async def test_deal(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text("✅ Test deal posted to the channel.")
 
 
+async def deal_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(update.effective_user.id):
+        await update.effective_message.reply_text("This command is owner-only.")
+        return
+    context.user_data["deal"] = {}
+    context.user_data["flow"] = "deal_url"
+    await update.effective_message.reply_text(
+        "🔗 Paste the full product URL from Amazon, eBay, Currys or another retailer.\n\n"
+        "Use /cancel at any time to stop."
+    )
+
+
+async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data.pop("deal", None)
+    context.user_data.pop("search", None)
+    context.user_data.pop("flow", None)
+    await update.effective_message.reply_text("Cancelled.", reply_markup=main_menu())
+
+
+async def receive_deal_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    url = update.effective_message.text.strip()
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+        await update.effective_message.reply_text(
+            "That does not look like a complete URL. Please paste a link beginning with `https://`.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    context.user_data["deal"] = {
+        "url": url,
+        "retailer": retailer_name(parsed.netloc),
+    }
+    context.user_data["flow"] = "deal_title"
+    await update.effective_message.reply_text("🏷 Send the product title.")
+
+
+def retailer_name(host: str) -> str:
+    host = host.lower()
+    if "amazon." in host:
+        return "Amazon UK"
+    if "ebay." in host:
+        return "eBay UK"
+    if "currys." in host:
+        return "Currys"
+    return host.removeprefix("www.")
+
+
+def clean_price(value: str) -> str | None:
+    cleaned = value.strip().replace("£", "").replace(",", "")
+    try:
+        price = float(cleaned)
+    except ValueError:
+        return None
+    if price <= 0:
+        return None
+    return f"£{price:,.2f}"
+
+
+async def receive_deal_price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    price = clean_price(update.effective_message.text)
+    if not price:
+        await update.effective_message.reply_text("Please enter a valid price, for example `449.00`.", parse_mode=ParseMode.MARKDOWN)
+        return
+    context.user_data["deal"]["price"] = price
+    context.user_data["flow"] = "deal_old_price"
+    await update.effective_message.reply_text(
+        "📉 What was the previous price?\n\n"
+        "Send a price such as `599.00`, or send `skip` if it cannot be verified.",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+async def receive_deal_old_price(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    value = update.effective_message.text.strip()
+    if value.lower() != "skip":
+        old_price = clean_price(value)
+        if not old_price:
+            await update.effective_message.reply_text("Enter a valid price or send `skip`.", parse_mode=ParseMode.MARKDOWN)
+            return
+        context.user_data["deal"]["old_price"] = old_price
+    context.user_data.pop("flow", None)
+    await show_deal_preview(update.effective_message, context)
+
+
+def deal_card(deal: dict, preview: bool = False) -> str:
+    heading = "👀 <b>PRIVATE DEAL PREVIEW</b>" if preview else "🔥 <b>DEAL FOUND</b>"
+    old_line = ""
+    if deal.get("old_price"):
+        old_line = f"\n📉 Previous price: <s>{escape(deal['old_price'])}</s>"
+    return (
+        f"{heading}\n\n"
+        f"<b>{escape(deal['title'])}</b>\n\n"
+        f"💷 <b>{escape(deal['price'])}</b>{old_line}\n"
+        f"🏪 {escape(deal['retailer'])}\n"
+        "🚚 Check delivery and final price with the retailer\n\n"
+        "<i>Affiliate link: we may earn a commission at no extra cost to you. "
+        "Prices can change; verify before purchasing.</i>"
+    )
+
+
+async def show_deal_preview(message, context: ContextTypes.DEFAULT_TYPE) -> None:
+    deal = context.user_data["deal"]
+    keyboard = InlineKeyboardMarkup(
+        [[
+            InlineKeyboardButton("✅ Publish", callback_data="deal_approve"),
+            InlineKeyboardButton("❌ Reject", callback_data="deal_reject"),
+        ], [InlineKeyboardButton("🔗 Open product", url=deal["url"])]]
+    )
+    await message.reply_text(
+        deal_card(deal, preview=True),
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
+        disable_web_page_preview=True,
+    )
+
+
+async def approve_deal(query, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not is_admin(query.from_user.id):
+        await query.answer("Owner only", show_alert=True)
+        return
+    deal = context.user_data.get("deal")
+    if not deal:
+        await query.edit_message_text("This preview has expired. Start again with /deal.")
+        return
+    if not DEALS_CHANNEL_ID:
+        await query.message.reply_text("DEALS_CHANNEL_ID is not configured.")
+        return
+    keyboard = InlineKeyboardMarkup(
+        [[InlineKeyboardButton("🛒 View deal", url=deal["url"])]]
+    )
+    await context.bot.send_message(
+        chat_id=DEALS_CHANNEL_ID,
+        text=deal_card(deal),
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
+        disable_web_page_preview=True,
+    )
+    context.user_data.pop("deal", None)
+    await query.edit_message_text("✅ Deal published to the channel.")
+
+
 def build_application() -> Application:
     if not TELEGRAM_TOKEN:
         raise RuntimeError("TELEGRAM_TOKEN is missing")
@@ -237,6 +461,8 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("id", show_id))
     app.add_handler(CommandHandler("disclosure", disclosure))
     app.add_handler(CommandHandler("testdeal", test_deal))
+    app.add_handler(CommandHandler("deal", deal_command))
+    app.add_handler(CommandHandler("cancel", cancel_command))
     app.add_handler(CallbackQueryHandler(button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, demo_search))
     return app
