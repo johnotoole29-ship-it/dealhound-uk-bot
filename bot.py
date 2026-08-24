@@ -1,10 +1,16 @@
+import asyncio
+import base64
+import json
 import logging
 import os
 import threading
+import time
 from html import escape
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from ipaddress import ip_address
-from urllib.parse import urlparse
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlencode, urlparse
+from urllib.request import Request, urlopen
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
@@ -27,19 +33,27 @@ logger = logging.getLogger("DealHoundUK")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 ADMIN_TELEGRAM_ID = os.getenv("ADMIN_TELEGRAM_ID", "").strip()
 DEALS_CHANNEL_ID = os.getenv("DEALS_CHANNEL_ID", "").strip()
+EBAY_CLIENT_ID = os.getenv("EBAY_CLIENT_ID", "").strip()
+EBAY_CLIENT_SECRET = os.getenv("EBAY_CLIENT_SECRET", "").strip()
 PORT = int(os.getenv("PORT", "8080"))
 
 MAX_SEARCH_LENGTH = 200
 MAX_TITLE_LENGTH = 180
 MAX_FEEDBACK_LENGTH = 1000
+EBAY_TIMEOUT_SECONDS = 12
+EBAY_RESULT_LIMIT = 3
+
+_ebay_token = ""
+_ebay_token_expires_at = 0.0
+_ebay_token_lock = threading.Lock()
 
 RETAILER_STATUSES = [
     ("Currys", "🟠 Pending approval"),
     ("AO.com", "🟠 Pending approval"),
-    ("Very", "🟠 Pending approval"),
+    ("Very", "🔴 Reapply later — requires 200 Awin sales/month"),
     ("The Range", "🟠 Pending approval"),
     ("Marks & Spencer", "🟠 Pending approval"),
-    ("eBay UK", "🟠 Developer approval pending"),
+    ("eBay UK", "🟢 Live search"),
     ("Amazon UK", "⚪ Coming later"),
 ]
 
@@ -184,32 +198,167 @@ async def demo_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     )
 
 
-async def send_demo_result(message, context: ContextTypes.DEFAULT_TYPE) -> None:
+def ebay_access_token() -> str:
+    global _ebay_token, _ebay_token_expires_at
+    if not EBAY_CLIENT_ID or not EBAY_CLIENT_SECRET:
+        raise RuntimeError("eBay credentials are not configured")
+
+    with _ebay_token_lock:
+        now = time.monotonic()
+        if _ebay_token and now < _ebay_token_expires_at:
+            return _ebay_token
+
+        credentials = base64.b64encode(
+            f"{EBAY_CLIENT_ID}:{EBAY_CLIENT_SECRET}".encode("utf-8")
+        ).decode("ascii")
+        body = urlencode(
+            {
+                "grant_type": "client_credentials",
+                "scope": "https://api.ebay.com/oauth/api_scope",
+            }
+        ).encode("ascii")
+        request = Request(
+            "https://api.ebay.com/identity/v1/oauth2/token",
+            data=body,
+            headers={
+                "Authorization": f"Basic {credentials}",
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+            method="POST",
+        )
+        with urlopen(request, timeout=EBAY_TIMEOUT_SECONDS) as response:
+            payload = json.load(response)
+        token = payload.get("access_token", "")
+        if not token:
+            raise RuntimeError("eBay did not return an access token")
+        expires_in = max(int(payload.get("expires_in", 7200)), 120)
+        _ebay_token = token
+        _ebay_token_expires_at = now + expires_in - 60
+        return token
+
+
+def search_ebay(query: str, budget: int | None, condition: str) -> list[dict]:
+    filters = []
+    if budget is not None:
+        filters.extend([f"price:[..{budget}]", "priceCurrency:GBP"])
+    condition_filter = {
+        "New": "NEW",
+        "Used": "USED",
+        "Refurbished": (
+            "CERTIFIED_REFURBISHED|EXCELLENT_REFURBISHED|"
+            "VERY_GOOD_REFURBISHED|GOOD_REFURBISHED|SELLER_REFURBISHED"
+        ),
+    }.get(condition)
+    if condition_filter:
+        filters.append(f"conditions:{{{condition_filter}}}")
+
+    params = {"q": query, "limit": str(EBAY_RESULT_LIMIT)}
+    if filters:
+        params["filter"] = ",".join(filters)
+    request = Request(
+        "https://api.ebay.com/buy/browse/v1/item_summary/search?" + urlencode(params),
+        headers={
+            "Authorization": f"Bearer {ebay_access_token()}",
+            "X-EBAY-C-MARKETPLACE-ID": "EBAY_GB",
+            "Accept": "application/json",
+        },
+    )
+    with urlopen(request, timeout=EBAY_TIMEOUT_SECONDS) as response:
+        payload = json.load(response)
+
+    results = []
+    for item in payload.get("itemSummaries", []):
+        url = item.get("itemWebUrl", "")
+        parsed = urlparse(url)
+        price = item.get("price", {})
+        if not url or not is_safe_ebay_url(parsed) or price.get("currency") != "GBP":
+            continue
+        shipping = "Check listing"
+        shipping_options = item.get("shippingOptions") or []
+        if shipping_options:
+            shipping_cost = shipping_options[0].get("shippingCost", {})
+            if shipping_cost.get("currency") == "GBP":
+                shipping_value = float(shipping_cost.get("value", 0))
+                shipping = "Free" if shipping_value == 0 else f"£{shipping_value:,.2f}"
+        results.append(
+            {
+                "title": str(item.get("title", "eBay listing"))[:180],
+                "price": f"£{float(price['value']):,.2f}",
+                "condition": str(item.get("condition", "Not specified"))[:80],
+                "shipping": shipping,
+                "url": url,
+            }
+        )
+    return results
+
+
+def is_safe_ebay_url(parsed) -> bool:
+    if parsed.scheme != "https" or not parsed.hostname:
+        return False
+    host = parsed.hostname.lower().rstrip(".")
+    return host == "ebay.co.uk" or host.endswith(".ebay.co.uk")
+
+
+async def send_live_result(message, context: ContextTypes.DEFAULT_TYPE) -> None:
     search = context.user_data.get("search", {})
     query = search.get("query", "product")
     budget = search.get("budget", "No maximum")
     condition = search.get("condition", "Any")
-    keyboard = InlineKeyboardMarkup(
+    await message.reply_text("🐶 Searching live eBay UK listings…")
+    try:
+        results = await asyncio.to_thread(
+            search_ebay, query, search.get("budget_value"), condition
+        )
+    except (HTTPError, URLError, TimeoutError, ValueError, RuntimeError, OSError):
+        logger.exception("eBay search failed")
+        await message.reply_text(
+            "Sorry, eBay search is temporarily unavailable. Please try again shortly.",
+            reply_markup=main_menu(),
+        )
+        context.user_data.pop("flow", None)
+        return
+
+    if not results:
+        await message.reply_text(
+            "I couldn't find a matching eBay UK listing with those filters. "
+            "Try a broader search or choose Any condition.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("🔎 Search again", callback_data="find")]]
+            ),
+        )
+        context.user_data.pop("flow", None)
+        return
+
+    lines = [
+        "🐶 <b>Live eBay UK matches</b>",
+        f"🔎 {escape(query)}",
+        f"💷 Maximum: <b>{escape(str(budget))}</b>",
+        f"📦 Condition: <b>{escape(condition)}</b>",
+    ]
+    buttons = []
+    for number, item in enumerate(results, 1):
+        lines.extend(
+            [
+                "",
+                f"<b>{number}. {escape(item['title'])}</b>",
+                f"💷 {escape(item['price'])}",
+                f"🚚 Delivery: {escape(item['shipping'])}",
+                f"📦 {escape(item['condition'])}",
+            ]
+        )
+        buttons.append([InlineKeyboardButton(f"View result {number}", url=item["url"])])
+    lines.extend(
         [
-            [InlineKeyboardButton("View example deal", url="https://www.ebay.co.uk/")],
-            [InlineKeyboardButton("⏰ Alert me", callback_data="alert_demo")],
-            [InlineKeyboardButton("🔎 Search again", callback_data="find")],
+            "",
+            "<i>Results are supplied by eBay. Check the listing, delivery and final price before buying.</i>",
+            "<i>Affiliate links may earn us a commission at no extra cost to you.</i>",
         ]
     )
+    buttons.append([InlineKeyboardButton("🔎 Search again", callback_data="find")])
     await message.reply_text(
-        "🐶 <b>DealHound searched for:</b>\n"
-        f"{escape(query)}\n\n"
-        f"💷 Maximum: <b>{escape(str(budget))}</b>\n"
-        f"📦 Condition: <b>{escape(condition)}</b>\n\n"
-        "🏷 <b>Example matching result</b>\n"
-        "💷 £449.00\n"
-        "🏪 eBay UK\n"
-        "📦 Condition: New\n\n"
-        "<i>Demo result — live retailer prices will appear when the eBay "
-        "developer account is connected.</i>\n\n"
-        "<i>Affiliate links may earn us a commission at no extra cost to you.</i>",
+        "\n".join(lines),
         parse_mode=ParseMode.HTML,
-        reply_markup=keyboard,
+        reply_markup=InlineKeyboardMarkup(buttons),
         disable_web_page_preview=True,
     )
     context.user_data.pop("flow", None)
@@ -229,6 +378,9 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
     elif query.data.startswith("budget:"):
         value = query.data.split(":", 1)[1]
+        context.user_data.setdefault("search", {})["budget_value"] = (
+            None if value == "any" else int(value)
+        )
         context.user_data.setdefault("search", {})["budget"] = (
             "No maximum" if value == "any" else f"£{int(value):,}"
         )
@@ -249,7 +401,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     elif query.data.startswith("condition:"):
         value = query.data.split(":", 1)[1]
         context.user_data.setdefault("search", {})["condition"] = value.title()
-        await send_demo_result(query.message, context)
+        await send_live_result(query.message, context)
     elif query.data == "deal_approve":
         await approve_deal(query, context)
     elif query.data == "deal_reject":
