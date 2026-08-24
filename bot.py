@@ -31,7 +31,7 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger("DealHoundUK")
-RELEASE_LABEL = "multi-app-deal-sharing-1"
+RELEASE_LABEL = "paginated-search-results-1"
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 ADMIN_TELEGRAM_ID = os.getenv("ADMIN_TELEGRAM_ID", "").strip()
@@ -47,6 +47,8 @@ MAX_FEEDBACK_LENGTH = 1000
 MAX_CUSTOM_BUDGET = 1_000_000
 EBAY_TIMEOUT_SECONDS = 12
 EBAY_RESULT_LIMIT = 3
+EBAY_MAX_RESULTS = 9
+EBAY_MORE_COOLDOWN_SECONDS = 2.0
 
 _ebay_token = ""
 _ebay_token_expires_at = 0.0
@@ -181,7 +183,9 @@ async def begin_product_search(message, context: ContextTypes.DEFAULT_TYPE, quer
             f"Please keep searches between 1 and {MAX_SEARCH_LENGTH} characters."
         )
         return
-    context.user_data["search"] = {"query": query}
+    generation = int(context.user_data.get("search_generation", 0)) + 1
+    context.user_data["search_generation"] = generation
+    context.user_data["search"] = {"query": query, "generation": generation}
     context.user_data["flow"] = "search_budget"
     await message.reply_text(
         f"🐶 Searching for: <b>{escape(query)}</b>\n\n"
@@ -200,6 +204,11 @@ async def edit_search_filters(message, context: ContextTypes.DEFAULT_TYPE) -> No
             "That search has expired. What would you like me to find?"
         )
         return
+    generation = int(context.user_data.get("search_generation", 0)) + 1
+    context.user_data["search_generation"] = generation
+    search["generation"] = generation
+    search.pop("next_offset", None)
+    search.pop("loading_more", None)
     context.user_data["flow"] = "search_budget"
     await message.reply_text(
         f"⚙️ <b>Change filters</b>\n\n"
@@ -329,7 +338,9 @@ def ebay_access_token() -> str:
         return token
 
 
-def search_ebay(query: str, budget: int | None, condition: str) -> list[dict]:
+def search_ebay(
+    query: str, budget: int | None, condition: str, offset: int = 0
+) -> tuple[list[dict], bool]:
     if not EBAY_CAMPAIGN_ID.isdigit() or len(EBAY_CAMPAIGN_ID) != 10:
         raise RuntimeError("eBay campaign ID is not configured correctly")
 
@@ -347,7 +358,11 @@ def search_ebay(query: str, budget: int | None, condition: str) -> list[dict]:
     if condition_filter:
         filters.append(f"conditions:{{{condition_filter}}}")
 
-    params = {"q": query, "limit": str(EBAY_RESULT_LIMIT)}
+    params = {
+        "q": query,
+        "limit": str(EBAY_RESULT_LIMIT),
+        "offset": str(offset),
+    }
     if filters:
         params["filter"] = ",".join(filters)
     request = Request(
@@ -397,7 +412,7 @@ def search_ebay(query: str, budget: int | None, condition: str) -> list[dict]:
                 "url": url,
             }
         )
-    return results
+    return results, bool(payload.get("next"))
 
 
 def is_safe_ebay_url(parsed) -> bool:
@@ -449,15 +464,22 @@ def whatsapp_share_url(item: dict) -> str:
     )
 
 
-async def send_live_result(message, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def send_live_result(
+    message, context: ContextTypes.DEFAULT_TYPE, offset: int = 0
+) -> None:
     search = context.user_data.get("search", {})
     query = search.get("query", "product")
     budget = search.get("budget", "No maximum")
     condition = search.get("condition", "Any")
-    await message.reply_text("🐶 Searching live eBay UK listings…")
+    if offset == 0:
+        search.pop("next_offset", None)
+        search["displayed_count"] = 0
+        await message.reply_text("🐶 Searching live eBay UK listings…")
+    else:
+        await message.reply_text("🐶 Fetching three more eBay UK matches…")
     try:
-        results = await asyncio.to_thread(
-            search_ebay, query, search.get("budget_value"), condition
+        results, has_more = await asyncio.to_thread(
+            search_ebay, query, search.get("budget_value"), condition, offset
         )
     except (HTTPError, URLError, TimeoutError, ValueError, RuntimeError, OSError):
         logger.exception("eBay search failed")
@@ -468,7 +490,7 @@ async def send_live_result(message, context: ContextTypes.DEFAULT_TYPE) -> None:
         context.user_data.pop("flow", None)
         return
 
-    if not results:
+    if not results and offset == 0:
         await message.reply_text(
             "I couldn't find a matching eBay UK listing with those filters. "
             "Try a broader search or choose Any condition.",
@@ -481,16 +503,30 @@ async def send_live_result(message, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         context.user_data.pop("flow", None)
         return
+    if not results:
+        search.pop("next_offset", None)
+        await message.reply_text(
+            "That was the end of the matching results.",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("⚙️ Change filters", callback_data="filters_edit")],
+                    [InlineKeyboardButton("🔎 New search", callback_data="find")],
+                ]
+            ),
+        )
+        return
 
-    await message.reply_text(
-        "🐶 <b>DealHound found these live eBay UK matches</b>\n\n"
-        f"🔎 {escape(query)}\n"
-        f"💷 Maximum: <b>{escape(str(budget))}</b>\n"
-        f"📦 Condition: <b>{escape(condition)}</b>",
-        parse_mode=ParseMode.HTML,
-    )
+    if offset == 0:
+        await message.reply_text(
+            "🐶 <b>DealHound found these live eBay UK matches</b>\n\n"
+            f"🔎 {escape(query)}\n"
+            f"💷 Maximum: <b>{escape(str(budget))}</b>\n"
+            f"📦 Condition: <b>{escape(condition)}</b>",
+            parse_mode=ParseMode.HTML,
+        )
 
-    for number, item in enumerate(results, 1):
+    first_shown = int(search.get("displayed_count", 0)) + 1
+    for number, item in enumerate(results, first_shown):
         keyboard = InlineKeyboardMarkup(
             [
                 [InlineKeyboardButton("🛒 View deal on eBay", url=item["url"])],
@@ -519,27 +555,91 @@ async def send_live_result(message, context: ContextTypes.DEFAULT_TYPE) -> None:
             disable_web_page_preview=True,
         )
 
+    next_offset = offset + EBAY_RESULT_LIMIT
+    can_show_more = has_more and next_offset < EBAY_MAX_RESULTS
+    if can_show_more:
+        search["next_offset"] = next_offset
+    else:
+        search.pop("next_offset", None)
+    generation = int(search.get("generation", 0))
+    controls = []
+    if can_show_more:
+        controls.append(
+            [
+                InlineKeyboardButton(
+                    "➕ Show 3 more",
+                    callback_data=f"results_more:{generation}:{next_offset}",
+                )
+            ]
+        )
+    controls.extend(
+        [
+            [InlineKeyboardButton("⚙️ Change filters", callback_data="filters_edit")],
+            [InlineKeyboardButton("🔎 New search", callback_data="find")],
+        ]
+    )
+    last_shown = first_shown + len(results) - 1
+    search["displayed_count"] = last_shown
     await message.reply_text(
-        "✅ <b>Search complete</b>\n\n"
+        f"✅ <b>Showing results {first_shown}–{last_shown}</b>\n\n"
         "Results are supplied by eBay and may include close alternatives. "
         "Prices and availability can change.\n\n"
         "<i>Affiliate links may earn us a commission at no extra cost to you.</i>",
         parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup(
-            [
-                [InlineKeyboardButton("⚙️ Change filters", callback_data="filters_edit")],
-                [InlineKeyboardButton("🔎 New search", callback_data="find")],
-            ]
-        ),
+        reply_markup=InlineKeyboardMarkup(controls),
     )
     context.user_data.pop("flow", None)
 
 
 async def button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    if query.data not in ("deal_approve", "deal_reject"):
+    if query.data not in ("deal_approve", "deal_reject") and not query.data.startswith(
+        "results_more:"
+    ):
         await query.answer()
 
+    if query.data.startswith("results_more:"):
+        parts = query.data.split(":")
+        search = context.user_data.get("search", {})
+        if len(parts) != 3:
+            await query.answer("This button is no longer valid.", show_alert=True)
+            return
+        try:
+            generation = int(parts[1])
+            offset = int(parts[2])
+        except (IndexError, ValueError):
+            await query.answer("This button is no longer valid.", show_alert=True)
+            return
+        expected_generation = int(search.get("generation", -1))
+        expected_offset = search.get("next_offset")
+        if (
+            generation != expected_generation
+            or offset != expected_offset
+            or offset < EBAY_RESULT_LIMIT
+            or offset >= EBAY_MAX_RESULTS
+        ):
+            await query.answer("These results have expired. Start a new search.", show_alert=True)
+            return
+        if search.get("loading_more"):
+            await query.answer("More results are already loading.")
+            return
+        now = time.monotonic()
+        if now - float(search.get("last_more_at", 0)) < EBAY_MORE_COOLDOWN_SECONDS:
+            await query.answer("Please wait a moment before loading more results.")
+            return
+        search["loading_more"] = True
+        search["last_more_at"] = now
+        search.pop("next_offset", None)
+        await query.answer("Finding more results…")
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except TelegramError:
+            logger.warning("Could not remove an old pagination button")
+        try:
+            await send_live_result(query.message, context, offset=offset)
+        finally:
+            search["loading_more"] = False
+        return
     if query.data == "find":
         context.user_data["flow"] = "search_query"
         await query.message.reply_text(
