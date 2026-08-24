@@ -12,7 +12,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 from ipaddress import ip_address
 from math import isfinite
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode, urlparse
+from urllib.parse import quote, urlencode, urlparse
 from urllib.request import Request, urlopen
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -33,7 +33,7 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger("DealHoundUK")
-RELEASE_LABEL = "search-back-button-1"
+RELEASE_LABEL = "automatic-price-alerts-1"
 DEALS_CHANNEL_URL = "https://t.me/Dealhounduk"
 BOT_PRIVATE_URL = "https://t.me/DealHoundUKBot"
 
@@ -52,10 +52,16 @@ MAX_TITLE_LENGTH = 180
 MAX_FEEDBACK_LENGTH = 1000
 MAX_CUSTOM_BUDGET = 1_000_000
 MAX_FAVORITES_PER_USER = 25
+MAX_PRICE_ALERTS_PER_USER = 20
 EBAY_TIMEOUT_SECONDS = 12
 EBAY_RESULT_LIMIT = 3
 EBAY_MAX_RESULTS = 9
 EBAY_MORE_COOLDOWN_SECONDS = 2.0
+ALERT_CHECK_INTERVAL_SECONDS = max(
+    3600, int(os.getenv("ALERT_CHECK_INTERVAL_SECONDS", "21600"))
+)
+ALERT_INITIAL_DELAY_SECONDS = 90
+ALERT_MAX_ITEMS_PER_CYCLE = 500
 
 _ebay_token = ""
 _ebay_token_expires_at = 0.0
@@ -110,6 +116,32 @@ def init_database() -> None:
                 saved_at TEXT NOT NULL,
                 UNIQUE (telegram_user_id, item_id)
             )
+            """
+        )
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS price_alerts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_user_id INTEGER NOT NULL,
+                telegram_chat_id INTEGER NOT NULL,
+                item_id TEXT NOT NULL,
+                title TEXT NOT NULL,
+                current_price REAL NOT NULL,
+                lowest_price REAL NOT NULL,
+                currency TEXT NOT NULL DEFAULT 'GBP',
+                url TEXT NOT NULL,
+                image_url TEXT NOT NULL DEFAULT '',
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL,
+                checked_at TEXT,
+                UNIQUE (telegram_user_id, item_id)
+            )
+            """
+        )
+        connection.execute(
+            """
+            CREATE INDEX IF NOT EXISTS idx_price_alerts_active_item
+            ON price_alerts (active, item_id)
             """
         )
 
@@ -194,6 +226,187 @@ def clear_favorites(user_id: int) -> int:
             "DELETE FROM favorites WHERE telegram_user_id = ?", (user_id,)
         )
         return cursor.rowcount
+
+
+def save_price_alert(
+    user_id: int, chat_id: int, item: dict
+) -> tuple[str, int | None]:
+    item_id = str(item.get("item_id", ""))[:200]
+    title = str(item.get("title", ""))[:180]
+    url = str(item.get("url", ""))[:2000]
+    try:
+        price_value = float(item.get("price_value"))
+    except (TypeError, ValueError):
+        price_value = -1
+    if (
+        not item_id
+        or not title
+        or price_value < 0
+        or not isfinite(price_value)
+        or not is_safe_ebay_url(urlparse(url))
+    ):
+        raise ValueError("Invalid price alert item")
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    image_url = str(item.get("image_url", ""))[:2000]
+    with database_connection() as connection:
+        existing = connection.execute(
+            """
+            SELECT id, active FROM price_alerts
+            WHERE telegram_user_id = ? AND item_id = ?
+            """,
+            (user_id, item_id),
+        ).fetchone()
+        if existing:
+            if int(existing["active"]) == 1:
+                connection.execute(
+                    """
+                    UPDATE price_alerts
+                    SET telegram_chat_id = ?, title = ?, url = ?, image_url = ?
+                    WHERE id = ? AND telegram_user_id = ?
+                    """,
+                    (chat_id, title, url, image_url, existing["id"], user_id),
+                )
+                return "existing", int(existing["id"])
+            connection.execute(
+                """
+                UPDATE price_alerts
+                SET telegram_chat_id = ?, title = ?, current_price = ?,
+                    lowest_price = ?, url = ?, image_url = ?, active = 1,
+                    created_at = ?, checked_at = NULL
+                WHERE id = ? AND telegram_user_id = ?
+                """,
+                (
+                    chat_id,
+                    title,
+                    price_value,
+                    price_value,
+                    url,
+                    image_url,
+                    now,
+                    existing["id"],
+                    user_id,
+                ),
+            )
+            return "saved", int(existing["id"])
+        count = connection.execute(
+            """
+            SELECT COUNT(*) AS count FROM price_alerts
+            WHERE telegram_user_id = ? AND active = 1
+            """,
+            (user_id,),
+        ).fetchone()["count"]
+        if int(count) >= MAX_PRICE_ALERTS_PER_USER:
+            return "limit", None
+        cursor = connection.execute(
+            """
+            INSERT INTO price_alerts (
+                telegram_user_id, telegram_chat_id, item_id, title,
+                current_price, lowest_price, currency, url, image_url,
+                active, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, 'GBP', ?, ?, 1, ?)
+            """,
+            (
+                user_id,
+                chat_id,
+                item_id,
+                title,
+                price_value,
+                price_value,
+                url,
+                image_url,
+                now,
+            ),
+        )
+        return "saved", int(cursor.lastrowid)
+
+
+def load_price_alerts(user_id: int) -> list[dict]:
+    with database_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT id, title, current_price, lowest_price, url, checked_at, created_at
+            FROM price_alerts
+            WHERE telegram_user_id = ? AND active = 1
+            ORDER BY created_at DESC, id DESC
+            LIMIT ?
+            """,
+            (user_id, MAX_PRICE_ALERTS_PER_USER),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def delete_price_alert(user_id: int, alert_id: int) -> bool:
+    with database_connection() as connection:
+        cursor = connection.execute(
+            """
+            UPDATE price_alerts SET active = 0
+            WHERE id = ? AND telegram_user_id = ? AND active = 1
+            """,
+            (alert_id, user_id),
+        )
+        return cursor.rowcount == 1
+
+
+def clear_price_alerts(user_id: int) -> int:
+    with database_connection() as connection:
+        cursor = connection.execute(
+            """
+            UPDATE price_alerts SET active = 0
+            WHERE telegram_user_id = ? AND active = 1
+            """,
+            (user_id,),
+        )
+        return cursor.rowcount
+
+
+def load_alert_check_rows() -> list[dict]:
+    with database_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT id, telegram_user_id, telegram_chat_id, item_id, title,
+                   current_price, lowest_price, url, image_url
+            FROM price_alerts
+            WHERE active = 1
+            ORDER BY COALESCE(checked_at, created_at) ASC, id ASC
+            LIMIT ?
+            """,
+            (ALERT_MAX_ITEMS_PER_CYCLE,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def record_alert_check(alert_id: int, price: float, url: str) -> bool:
+    """Record a check and return True only for a new all-time low."""
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with database_connection() as connection:
+        row = connection.execute(
+            """
+            SELECT lowest_price FROM price_alerts WHERE id = ? AND active = 1
+            """,
+            (alert_id,),
+        ).fetchone()
+        if not row:
+            return False
+        dropped = price < float(row["lowest_price"]) - 0.005
+        if dropped:
+            connection.execute(
+                """
+                UPDATE price_alerts
+                SET current_price = ?, lowest_price = ?, url = ?, checked_at = ?
+                WHERE id = ? AND active = 1
+                """,
+                (price, price, url, now, alert_id),
+            )
+        else:
+            connection.execute(
+                """
+                UPDATE price_alerts
+                SET current_price = ?, url = ?, checked_at = ?
+                WHERE id = ? AND active = 1
+                """,
+                (price, url, now, alert_id),
+            )
+        return dropped
 
 
 class HealthHandler(BaseHTTPRequestHandler):
@@ -587,6 +800,7 @@ def search_ebay(
                 "item_id": item_id,
                 "title": str(item.get("title", "eBay listing"))[:180],
                 "price": f"£{item_price:,.2f}",
+                "price_value": item_price,
                 "condition": str(item.get("condition", "Not specified"))[:80],
                 "shipping": shipping,
                 "total": total,
@@ -595,6 +809,41 @@ def search_ebay(
             }
         )
     return results, bool(payload.get("next"))
+
+
+def refresh_ebay_item(item_id: str) -> dict:
+    if not EBAY_CAMPAIGN_ID.isdigit() or len(EBAY_CAMPAIGN_ID) != 10:
+        raise RuntimeError("eBay campaign ID is not configured correctly")
+    safe_item_id = quote(str(item_id)[:200], safe="")
+    request = Request(
+        f"https://api.ebay.com/buy/browse/v1/item/{safe_item_id}?fieldgroups=COMPACT",
+        headers={
+            "Authorization": f"Bearer {ebay_access_token()}",
+            "X-EBAY-C-MARKETPLACE-ID": "EBAY_GB",
+            "X-EBAY-C-ENDUSERCTX": f"affiliateCampaignId={EBAY_CAMPAIGN_ID}",
+            "Accept": "application/json",
+        },
+    )
+    with urlopen(request, timeout=EBAY_TIMEOUT_SECONDS) as response:
+        item = json.load(response)
+    price = item.get("price", {})
+    url = item.get("itemAffiliateWebUrl", "")
+    try:
+        price_value = float(price.get("value"))
+    except (TypeError, ValueError):
+        price_value = -1
+    if (
+        price.get("currency") != "GBP"
+        or price_value < 0
+        or not isfinite(price_value)
+        or not is_safe_ebay_url(urlparse(url))
+    ):
+        raise ValueError("eBay returned an invalid item refresh")
+    return {
+        "price_value": price_value,
+        "url": url,
+        "title": str(item.get("title", ""))[:180],
+    }
 
 
 def is_safe_ebay_url(parsed) -> bool:
@@ -738,6 +987,163 @@ async def favorites_command(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     await send_favorites(update.effective_message, update.effective_user.id)
 
 
+async def send_price_alerts(message, user_id: int) -> None:
+    if message.chat.type != "private":
+        await message.reply_text(
+            "🔐 Price alerts are private. Open DealHound in a private chat to manage them.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("Open DealHound privately", url=BOT_PRIVATE_URL)]]
+            ),
+        )
+        return
+    try:
+        alerts = await asyncio.to_thread(load_price_alerts, user_id)
+    except (sqlite3.Error, OSError):
+        logger.exception("Could not load price alerts")
+        await message.reply_text("Price alerts are temporarily unavailable.")
+        return
+    if not alerts:
+        await message.reply_text(
+            "⏰ <b>Your price-drop alerts</b>\n\n"
+            "You aren't watching any products yet. Search for a product and tap "
+            "<b>Watch price</b> on its result card.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("🔎 Find a product", callback_data="find")]]
+            ),
+        )
+        return
+    await message.reply_text(
+        f"⏰ <b>Your price-drop alerts ({len(alerts)})</b>\n\n"
+        "DealHound checks these exact eBay listings automatically. You will receive "
+        "a private message when an item reaches a new lowest price since you started watching.",
+        parse_mode=ParseMode.HTML,
+    )
+    for number, alert in enumerate(alerts, 1):
+        checked = "Waiting for first automatic check"
+        if alert.get("checked_at"):
+            checked = str(alert["checked_at"]).replace("T", " ").replace("+00:00", " UTC")
+        await message.reply_text(
+            f"🔔 <b>{number}. {escape(alert['title'])}</b>\n\n"
+            f"💷 Current recorded price: <b>£{float(alert['current_price']):,.2f}</b>\n"
+            f"📉 Lowest recorded price: <b>£{float(alert['lowest_price']):,.2f}</b>\n"
+            f"🕒 {escape(checked)}\n\n"
+            "<i>Item price is monitored; delivery and availability can change.</i>\n#Ad",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [InlineKeyboardButton("🛒 View listing", url=alert["url"])],
+                    [
+                        InlineKeyboardButton(
+                            "🛑 Stop watching",
+                            callback_data=f"alert_remove:{int(alert['id'])}",
+                        )
+                    ],
+                ]
+            ),
+            disable_web_page_preview=True,
+        )
+    await message.reply_text(
+        "Manage your alerts:",
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("🗑 Clear all alerts", callback_data="alerts_clear")],
+                [InlineKeyboardButton("🔎 Find another product", callback_data="find")],
+                [InlineKeyboardButton("⬅️ Back to main menu", callback_data="menu_home")],
+            ]
+        ),
+    )
+
+
+async def alerts_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await send_price_alerts(update.effective_message, update.effective_user.id)
+
+
+async def run_price_alert_check(application: Application) -> None:
+    try:
+        alerts = await asyncio.to_thread(load_alert_check_rows)
+    except (sqlite3.Error, OSError):
+        logger.exception("Could not load automatic price alerts")
+        return
+    refresh_cache = {}
+    for alert in alerts:
+        try:
+            item_id = alert["item_id"]
+            if item_id not in refresh_cache:
+                refresh_cache[item_id] = await asyncio.to_thread(
+                    refresh_ebay_item, item_id
+                )
+            item = refresh_cache[item_id]
+            dropped = await asyncio.to_thread(
+                record_alert_check, alert["id"], item["price_value"], item["url"]
+            )
+        except HTTPError as error:
+            if error.code in (404, 410):
+                logger.info("Watched eBay item is no longer available: %s", alert["item_id"])
+            else:
+                logger.warning("eBay alert refresh failed with HTTP %s", error.code)
+            continue
+        except (URLError, TimeoutError, ValueError, RuntimeError, OSError, sqlite3.Error):
+            logger.exception("Could not refresh watched eBay item")
+            continue
+        if not dropped:
+            continue
+        old_price = float(alert["lowest_price"])
+        new_price = float(item["price_value"])
+        saving = old_price - new_price
+        try:
+            await application.bot.send_message(
+                chat_id=int(alert["telegram_chat_id"]),
+                text=(
+                    "🐶📉 <b>Genuine price drop detected!</b>\n\n"
+                    f"🏷 <b>{escape(alert['title'])}</b>\n\n"
+                    f"Was: <s>£{old_price:,.2f}</s>\n"
+                    f"Now: <b>£{new_price:,.2f}</b>\n"
+                    f"You save: <b>£{saving:,.2f}</b>\n\n"
+                    "<i>This is the item price on the exact watched eBay listing. "
+                    "Check delivery, availability and the final price before buying.</i>\n#Ad"
+                ),
+                parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup(
+                    [
+                        [InlineKeyboardButton("🛒 View price drop", url=item["url"])],
+                        [InlineKeyboardButton("⏰ Manage alerts", callback_data="alerts")],
+                    ]
+                ),
+                disable_web_page_preview=True,
+            )
+        except TelegramError:
+            logger.warning("Could not deliver price alert to Telegram user %s", alert["telegram_user_id"])
+
+
+async def price_alert_loop(application: Application) -> None:
+    await asyncio.sleep(ALERT_INITIAL_DELAY_SECONDS)
+    while True:
+        try:
+            await run_price_alert_check(application)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Unexpected automatic price alert failure")
+        await asyncio.sleep(ALERT_CHECK_INTERVAL_SECONDS)
+
+
+async def start_background_tasks(application: Application) -> None:
+    application.bot_data["price_alert_task"] = asyncio.create_task(
+        price_alert_loop(application), name="dealhound-price-alerts"
+    )
+
+
+async def stop_background_tasks(application: Application) -> None:
+    task = application.bot_data.pop("price_alert_task", None)
+    if task:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
 async def send_live_result(
     message, context: ContextTypes.DEFAULT_TYPE, offset: int = 0
 ) -> None:
@@ -816,6 +1222,12 @@ async def send_live_result(
                     )
                 ],
                 [
+                    InlineKeyboardButton(
+                        "🔔 Watch price",
+                        callback_data=f"alert_save:{generation}:{number}",
+                    )
+                ],
+                [
                     InlineKeyboardButton("📨 Telegram", url=telegram_share_url(item)),
                     InlineKeyboardButton("💬 WhatsApp", url=whatsapp_share_url(item)),
                 ],
@@ -880,7 +1292,15 @@ async def send_live_result(
 async def button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     manual_answer = query.data in ("deal_approve", "deal_reject") or query.data.startswith(
-        ("results_more:", "favorite_save:", "favorite_remove:", "favorites_clear")
+        (
+            "results_more:",
+            "favorite_save:",
+            "favorite_remove:",
+            "favorites_clear",
+            "alert_save:",
+            "alert_remove:",
+            "alerts_clear",
+        )
     )
     if not manual_answer:
         await query.answer()
@@ -919,6 +1339,53 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
         message = "Already saved — details refreshed." if status == "existing" else "Saved to favourites ❤️"
         await query.answer(message)
+        return
+    if query.data.startswith("alert_save:"):
+        if query.message.chat.type != "private":
+            await query.answer(
+                "Open the bot privately to create personal price alerts.", show_alert=True
+            )
+            return
+        parts = query.data.split(":")
+        if len(parts) != 3:
+            await query.answer("This alert button is invalid.", show_alert=True)
+            return
+        try:
+            generation = int(parts[1])
+            result_number = int(parts[2])
+        except ValueError:
+            await query.answer("This alert button is invalid.", show_alert=True)
+            return
+        search = context.user_data.get("search", {})
+        item = search.get("result_items", {}).get(str(result_number))
+        if generation != int(search.get("generation", -1)) or not item:
+            await query.answer(
+                "This result has expired. Run the search again to watch it.", show_alert=True
+            )
+            return
+        try:
+            status, _ = await asyncio.to_thread(
+                save_price_alert,
+                query.from_user.id,
+                query.message.chat.id,
+                item,
+            )
+        except (sqlite3.Error, OSError, ValueError):
+            logger.exception("Could not save price alert")
+            await query.answer("Could not create this alert right now.", show_alert=True)
+            return
+        if status == "limit":
+            await query.answer(
+                f"You can watch up to {MAX_PRICE_ALERTS_PER_USER} products.",
+                show_alert=True,
+            )
+            return
+        message = (
+            "Already watching this exact listing."
+            if status == "existing"
+            else "Price alert active 🔔"
+        )
+        await query.answer(message, show_alert=True)
         return
     if query.data.startswith("favorite_remove:"):
         parts = query.data.split(":")
@@ -980,6 +1447,62 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
         await query.answer("Favourites cleared.")
         await query.edit_message_text(f"🗑 Deleted {deleted} saved favourite(s).")
+        return
+    if query.data.startswith("alert_remove:"):
+        parts = query.data.split(":")
+        try:
+            alert_id = int(parts[1]) if len(parts) == 2 else 0
+        except ValueError:
+            alert_id = 0
+        if alert_id <= 0:
+            await query.answer("This stop button is invalid.", show_alert=True)
+            return
+        try:
+            removed = await asyncio.to_thread(
+                delete_price_alert, query.from_user.id, alert_id
+            )
+        except (sqlite3.Error, OSError):
+            logger.exception("Could not stop price alert")
+            await query.answer("Could not stop this alert right now.", show_alert=True)
+            return
+        await query.answer("Price alert stopped." if removed else "This alert was already stopped.")
+        if removed:
+            try:
+                await query.edit_message_text("🛑 Price alert stopped.")
+            except TelegramError:
+                logger.warning("Could not update a stopped alert card")
+        return
+    if query.data == "alerts_clear":
+        await query.answer()
+        await query.message.reply_text(
+            "Stop all your price alerts?",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "✅ Yes, stop all", callback_data="alerts_clear_confirm"
+                        ),
+                        InlineKeyboardButton(
+                            "❌ Cancel", callback_data="alerts_clear_cancel"
+                        ),
+                    ]
+                ]
+            ),
+        )
+        return
+    if query.data == "alerts_clear_cancel":
+        await query.answer("Cancelled.")
+        await query.edit_message_text("Your price alerts were not changed.")
+        return
+    if query.data == "alerts_clear_confirm":
+        try:
+            deleted = await asyncio.to_thread(clear_price_alerts, query.from_user.id)
+        except (sqlite3.Error, OSError):
+            logger.exception("Could not clear price alerts")
+            await query.answer("Could not clear alerts right now.", show_alert=True)
+            return
+        await query.answer("Price alerts cleared.")
+        await query.edit_message_text(f"🗑 Stopped {deleted} price alert(s).")
         return
     if query.data.startswith("results_more:"):
         parts = query.data.split(":")
@@ -1094,14 +1617,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         clear_workflow(context)
         await begin_product_search(query.message, context, category[1])
     elif query.data == "alerts":
-        await query.message.reply_text(
-            "⏰ *Price alerts*\n\nPrice alerts will activate after live retailer prices are connected.",
-            parse_mode=ParseMode.MARKDOWN,
-        )
-    elif query.data == "alert_demo":
-        await query.message.reply_text(
-            "✅ The alert screen works. Saving live alerts is coming in the retailer phase."
-        )
+        await send_price_alerts(query.message, query.from_user.id)
     elif query.data == "retailers":
         await send_retailers(query.message)
     elif query.data == "feedback":
@@ -1152,8 +1668,12 @@ async def privacy_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "of that public product listing in encrypted persistent storage. It does not store "
         "your Telegram name with favourites. Saved items remain until you remove them or use "
         "Clear all favourites.\n\n"
+        "If you create a price alert, DealHound stores your numeric Telegram user and private "
+        "chat IDs plus the watched eBay listing, its recorded prices and check times. This is "
+        "used only to check that exact listing and send you a private price-drop message. "
+        "Alerts remain until you stop them or use Clear all alerts.\n\n"
         "Do not send passwords, payment-card information, API tokens or other sensitive data. "
-        "Price-alert storage will be explained before that feature goes live.",
+        "Prices, delivery and availability must still be checked with the retailer.",
         parse_mode=ParseMode.HTML,
     )
 
@@ -1220,6 +1740,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/find — Guided product search\n"
         "/deals — Latest deals\n"
         "/favorites — View and remove saved products\n"
+        "/alerts — View and stop automatic price alerts\n"
         "/categories — Browse shopping categories\n"
         "/retailers — Retailer connection status\n"
         "/feedback — Send a private suggestion\n"
@@ -1425,13 +1946,19 @@ def build_application() -> Application:
     if not TELEGRAM_TOKEN:
         raise RuntimeError("TELEGRAM_TOKEN is missing")
 
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app = (
+        Application.builder()
+        .token(TELEGRAM_TOKEN)
+        .post_init(start_background_tasks)
+        .post_shutdown(stop_background_tasks)
+        .build()
+    )
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("find", find_command))
     app.add_handler(CommandHandler("deals", deals_command))
     app.add_handler(CommandHandler("categories", categories_command))
     app.add_handler(CommandHandler(["favorites", "favourites"], favorites_command))
-    app.add_handler(CommandHandler("alerts", start))
+    app.add_handler(CommandHandler("alerts", alerts_command))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("id", show_id))
     app.add_handler(CommandHandler("disclosure", disclosure))

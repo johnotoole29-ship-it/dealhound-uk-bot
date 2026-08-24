@@ -1,14 +1,16 @@
 # DealHound UK Bot 🐶🔍
 
-DealHound UK is a Telegram shopping assistant that will compare UK retailer prices and publish owner-approved affiliate deals to a Telegram channel.
+DealHound UK is a Telegram shopping assistant that searches live UK retailer listings, saves favourites, monitors genuine price drops and publishes owner-approved affiliate deals to a Telegram channel.
 
 ## Current version
 
 The first version provides:
 
 - Interactive Telegram main menu
-- Conversational product-search demo
-- Deals, categories and price-alert screens
+- Live eBay UK Buy It Now search with price and condition filters
+- Persistent saved favourites and genuine automatic price-drop alerts
+- Product cards with delivery totals, Telegram and WhatsApp sharing
+- Deals and interactive shopping categories
 - Affiliate disclosure
 - `/id` command for setup
 - Owner-only `/testdeal` channel-post test
@@ -23,7 +25,7 @@ The first version provides:
 - HTTP health endpoint for Bunny Magic Containers
 - Secure environment-variable configuration
 
-Live retailer search will be connected after the relevant eBay, Awin/Currys and Amazon affiliate accounts are approved.
+eBay UK is live. Other retailer integrations will be connected after their affiliate accounts are approved and tested.
 
 ## Environment variables
 
@@ -33,8 +35,18 @@ Live retailer search will be connected after the relevant eBay, Awin/Currys and 
 | `ADMIN_TELEGRAM_ID` | Yes | Restricts owner-only commands |
 | `DEALS_CHANNEL_ID` | For test posts | Public `@channelusername` or numeric `-100...` channel ID |
 | `PORT` | No | Health server port; defaults to `8080` |
+| `DATA_DIR` | No | Persistent database directory; defaults to `/data` |
+| `ALERT_CHECK_INTERVAL_SECONDS` | No | Price-check interval; defaults to 6 hours and cannot be below 1 hour |
+| `EBAY_CLIENT_ID` | For eBay | Production App ID |
+| `EBAY_CLIENT_SECRET` | For eBay | Production Cert ID; keep secret |
+| `EBAY_CAMPAIGN_ID` | For tracked links | 10-digit eBay Partner Network campaign ID |
 
 Never commit the real token or other credentials to GitHub.
+
+Price alerts monitor the exact eBay listing selected by the user. The bot sends a
+private notification only when that listing reaches a new lowest item price since
+the alert was activated. Delivery, availability and the retailer's final price
+must still be checked before purchase.
 
 ## Run locally
 
