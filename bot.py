@@ -31,7 +31,8 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger("DealHoundUK")
-RELEASE_LABEL = "paginated-search-results-1"
+RELEASE_LABEL = "live-deals-channel-1"
+DEALS_CHANNEL_URL = "https://t.me/Dealhounduk"
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 ADMIN_TELEGRAM_ID = os.getenv("ADMIN_TELEGRAM_ID", "").strip()
@@ -91,7 +92,7 @@ def main_menu() -> InlineKeyboardMarkup:
         [
             [InlineKeyboardButton("🔎 Find a product", callback_data="find")],
             [
-                InlineKeyboardButton("🔥 Today's deals", callback_data="deals"),
+                InlineKeyboardButton("🔥 Today's deals", url=DEALS_CHANNEL_URL),
                 InlineKeyboardButton("🛍 Categories", callback_data="categories"),
             ],
             [
@@ -103,6 +104,12 @@ def main_menu() -> InlineKeyboardMarkup:
                 InlineKeyboardButton("💬 Feedback", callback_data="feedback"),
             ],
         ]
+    )
+
+
+def deals_channel_button() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [[InlineKeyboardButton("🔥 Open DealHound UK deals", url=DEALS_CHANNEL_URL)]]
     )
 
 
@@ -683,8 +690,9 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     elif query.data == "deals":
         await query.message.reply_text(
             "🔥 *Today's deals*\n\n"
-            "The live deal feed is being prepared. Your approved channel deals will appear here too.",
+            "Open the DealHound UK channel to see published deals and updates.",
             parse_mode=ParseMode.MARKDOWN,
+            reply_markup=deals_channel_button(),
         )
     elif query.data == "categories":
         await query.message.reply_text(
@@ -714,7 +722,10 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def deals_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(
-        "🔥 Live deals will appear here once the first retailer is connected."
+        "🔥 *DealHound UK deals*\n\n"
+        "Open the channel to see published deals and updates.",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=deals_channel_button(),
     )
 
 
