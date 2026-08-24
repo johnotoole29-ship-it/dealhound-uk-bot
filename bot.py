@@ -36,6 +36,7 @@ ADMIN_TELEGRAM_ID = os.getenv("ADMIN_TELEGRAM_ID", "").strip()
 DEALS_CHANNEL_ID = os.getenv("DEALS_CHANNEL_ID", "").strip()
 EBAY_CLIENT_ID = os.getenv("EBAY_CLIENT_ID", "").strip()
 EBAY_CLIENT_SECRET = os.getenv("EBAY_CLIENT_SECRET", "").strip()
+EBAY_CAMPAIGN_ID = os.getenv("EBAY_CAMPAIGN_ID", "").strip()
 PORT = int(os.getenv("PORT", "8080"))
 
 MAX_SEARCH_LENGTH = 200
@@ -239,6 +240,9 @@ def ebay_access_token() -> str:
 
 
 def search_ebay(query: str, budget: int | None, condition: str) -> list[dict]:
+    if not EBAY_CAMPAIGN_ID.isdigit() or len(EBAY_CAMPAIGN_ID) != 10:
+        raise RuntimeError("eBay campaign ID is not configured correctly")
+
     filters = []
     if budget is not None:
         filters.extend([f"price:[..{budget}]", "priceCurrency:GBP"])
@@ -261,6 +265,7 @@ def search_ebay(query: str, budget: int | None, condition: str) -> list[dict]:
         headers={
             "Authorization": f"Bearer {ebay_access_token()}",
             "X-EBAY-C-MARKETPLACE-ID": "EBAY_GB",
+            "X-EBAY-C-ENDUSERCTX": f"affiliateCampaignId={EBAY_CAMPAIGN_ID}",
             "Accept": "application/json",
         },
     )
@@ -269,7 +274,7 @@ def search_ebay(query: str, budget: int | None, condition: str) -> list[dict]:
 
     results = []
     for item in payload.get("itemSummaries", []):
-        url = item.get("itemWebUrl", "")
+        url = item.get("itemAffiliateWebUrl", "")
         parsed = urlparse(url)
         price = item.get("price", {})
         if not url or not is_safe_ebay_url(parsed) or price.get("currency") != "GBP":
