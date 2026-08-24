@@ -3,8 +3,10 @@ import base64
 import json
 import logging
 import os
+import sqlite3
 import threading
 import time
+from datetime import datetime, timezone
 from html import escape
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from ipaddress import ip_address
@@ -31,8 +33,9 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger("DealHoundUK")
-RELEASE_LABEL = "buy-it-now-results-1"
+RELEASE_LABEL = "persistent-favourites-1"
 DEALS_CHANNEL_URL = "https://t.me/Dealhounduk"
+BOT_PRIVATE_URL = "https://t.me/DealHoundUKBot"
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 ADMIN_TELEGRAM_ID = os.getenv("ADMIN_TELEGRAM_ID", "").strip()
@@ -41,11 +44,14 @@ EBAY_CLIENT_ID = os.getenv("EBAY_CLIENT_ID", "").strip()
 EBAY_CLIENT_SECRET = os.getenv("EBAY_CLIENT_SECRET", "").strip()
 EBAY_CAMPAIGN_ID = os.getenv("EBAY_CAMPAIGN_ID", "").strip()
 PORT = int(os.getenv("PORT", "8080"))
+DATA_DIR = os.getenv("DATA_DIR", "/data").strip() or "/data"
+DATABASE_PATH = os.path.join(DATA_DIR, "dealhound.db")
 
 MAX_SEARCH_LENGTH = 200
 MAX_TITLE_LENGTH = 180
 MAX_FEEDBACK_LENGTH = 1000
 MAX_CUSTOM_BUDGET = 1_000_000
+MAX_FAVORITES_PER_USER = 25
 EBAY_TIMEOUT_SECONDS = 12
 EBAY_RESULT_LIMIT = 3
 EBAY_MAX_RESULTS = 9
@@ -77,6 +83,119 @@ CATEGORY_SEARCHES = {
 }
 
 
+def database_connection() -> sqlite3.Connection:
+    connection = sqlite3.connect(DATABASE_PATH, timeout=5)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA busy_timeout = 5000")
+    return connection
+
+
+def init_database() -> None:
+    os.makedirs(DATA_DIR, exist_ok=True)
+    with database_connection() as connection:
+        connection.execute("PRAGMA journal_mode = WAL")
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS favorites (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                telegram_user_id INTEGER NOT NULL,
+                item_id TEXT NOT NULL,
+                title TEXT NOT NULL,
+                price TEXT NOT NULL,
+                shipping TEXT NOT NULL,
+                total TEXT NOT NULL,
+                condition TEXT NOT NULL,
+                url TEXT NOT NULL,
+                image_url TEXT NOT NULL DEFAULT '',
+                saved_at TEXT NOT NULL,
+                UNIQUE (telegram_user_id, item_id)
+            )
+            """
+        )
+
+
+def save_favorite(user_id: int, item: dict) -> tuple[str, int | None]:
+    item_id = str(item.get("item_id", ""))[:200]
+    title = str(item.get("title", ""))[:180]
+    url = str(item.get("url", ""))[:2000]
+    if not item_id or not title or not is_safe_ebay_url(urlparse(url)):
+        raise ValueError("Invalid favorite item")
+    values = (
+        title,
+        str(item.get("price", ""))[:30],
+        str(item.get("shipping", ""))[:30],
+        str(item.get("total", ""))[:30],
+        str(item.get("condition", ""))[:80],
+        url,
+        str(item.get("image_url", ""))[:2000],
+        datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    )
+    with database_connection() as connection:
+        existing = connection.execute(
+            "SELECT id FROM favorites WHERE telegram_user_id = ? AND item_id = ?",
+            (user_id, item_id),
+        ).fetchone()
+        if existing:
+            connection.execute(
+                """
+                UPDATE favorites
+                SET title = ?, price = ?, shipping = ?, total = ?, condition = ?,
+                    url = ?, image_url = ?, saved_at = ?
+                WHERE id = ? AND telegram_user_id = ?
+                """,
+                values + (existing["id"], user_id),
+            )
+            return "existing", int(existing["id"])
+        count = connection.execute(
+            "SELECT COUNT(*) AS count FROM favorites WHERE telegram_user_id = ?",
+            (user_id,),
+        ).fetchone()["count"]
+        if int(count) >= MAX_FAVORITES_PER_USER:
+            return "limit", None
+        cursor = connection.execute(
+            """
+            INSERT INTO favorites (
+                telegram_user_id, item_id, title, price, shipping, total,
+                condition, url, image_url, saved_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (user_id, item_id) + values,
+        )
+        return "saved", int(cursor.lastrowid)
+
+
+def load_favorites(user_id: int) -> list[dict]:
+    with database_connection() as connection:
+        rows = connection.execute(
+            """
+            SELECT id, title, price, shipping, total, condition, url, image_url, saved_at
+            FROM favorites
+            WHERE telegram_user_id = ?
+            ORDER BY saved_at DESC, id DESC
+            LIMIT ?
+            """,
+            (user_id, MAX_FAVORITES_PER_USER),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def delete_favorite(user_id: int, favorite_id: int) -> bool:
+    with database_connection() as connection:
+        cursor = connection.execute(
+            "DELETE FROM favorites WHERE id = ? AND telegram_user_id = ?",
+            (favorite_id, user_id),
+        )
+        return cursor.rowcount == 1
+
+
+def clear_favorites(user_id: int) -> int:
+    with database_connection() as connection:
+        cursor = connection.execute(
+            "DELETE FROM favorites WHERE telegram_user_id = ?", (user_id,)
+        )
+        return cursor.rowcount
+
+
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path in ("/", "/health"):
@@ -106,6 +225,7 @@ def main_menu() -> InlineKeyboardMarkup:
                 InlineKeyboardButton("🔥 Today's deals", url=DEALS_CHANNEL_URL),
                 InlineKeyboardButton("🛍 Categories", callback_data="categories"),
             ],
+            [InlineKeyboardButton("❤️ Saved favourites", callback_data="favorites")],
             [
                 InlineKeyboardButton("⏰ Price alerts", callback_data="alerts"),
                 InlineKeyboardButton("ℹ️ Help", callback_data="help"),
@@ -434,10 +554,16 @@ def search_ebay(
 
     results = []
     for item in payload.get("itemSummaries", []):
+        item_id = str(item.get("itemId", ""))[:200]
         url = item.get("itemAffiliateWebUrl", "")
         parsed = urlparse(url)
         price = item.get("price", {})
-        if not url or not is_safe_ebay_url(parsed) or price.get("currency") != "GBP":
+        if (
+            not item_id
+            or not url
+            or not is_safe_ebay_url(parsed)
+            or price.get("currency") != "GBP"
+        ):
             continue
         item_price = float(price["value"])
         shipping = "Check listing"
@@ -458,6 +584,7 @@ def search_ebay(
             image_url = ""
         results.append(
             {
+                "item_id": item_id,
                 "title": str(item.get("title", "eBay listing"))[:180],
                 "price": f"£{item_price:,.2f}",
                 "condition": str(item.get("condition", "Not specified"))[:80],
@@ -521,6 +648,96 @@ def whatsapp_share_url(item: dict) -> str:
     )
 
 
+def favorite_card_caption(number: int, item: dict) -> str:
+    return (
+        f"❤️ <b>Saved favourite {number}</b>\n\n"
+        f"🏷 <b>{escape(item['title'])}</b>\n"
+        f"💷 Item price when saved: <b>{escape(item['price'])}</b>\n"
+        f"🚚 Delivery when saved: {escape(item['shipping'])}\n"
+        f"💰 Total when saved: <b>{escape(item['total'])}</b>\n"
+        f"📦 Condition: {escape(item['condition'])}\n\n"
+        "<i>Prices and availability can change. Check eBay before buying.</i>\n"
+        "#Ad"
+    )
+
+
+async def send_favorites(message, user_id: int) -> None:
+    if message.chat.type != "private":
+        await message.reply_text(
+            "🔐 Saved favourites are private. Open DealHound in a private chat to view them.",
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("Open DealHound privately", url=BOT_PRIVATE_URL)]]
+            ),
+        )
+        return
+    try:
+        favorites = await asyncio.to_thread(load_favorites, user_id)
+    except (sqlite3.Error, OSError):
+        logger.exception("Could not load favorites")
+        await message.reply_text("Saved favourites are temporarily unavailable.")
+        return
+    if not favorites:
+        await message.reply_text(
+            "❤️ <b>Your saved favourites</b>\n\n"
+            "You haven't saved anything yet. Search for a product and tap "
+            "<b>Save favourite</b> on a result card.",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(
+                [[InlineKeyboardButton("🔎 Find a product", callback_data="find")]]
+            ),
+        )
+        return
+    await message.reply_text(
+        f"❤️ <b>Your saved favourites ({len(favorites)})</b>\n\n"
+        "Saved prices are a snapshot. Always check the current listing price.",
+        parse_mode=ParseMode.HTML,
+    )
+    for number, item in enumerate(favorites, 1):
+        keyboard = InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("🛒 Check current listing", url=item["url"])],
+                [
+                    InlineKeyboardButton(
+                        "🗑 Remove",
+                        callback_data=f"favorite_remove:{int(item['id'])}",
+                    )
+                ],
+            ]
+        )
+        caption = favorite_card_caption(number, item)
+        image_url = item.get("image_url", "")
+        if image_url and is_safe_ebay_image_url(urlparse(image_url)):
+            try:
+                await message.reply_photo(
+                    photo=image_url,
+                    caption=caption,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=keyboard,
+                )
+                continue
+            except TelegramError:
+                logger.warning("Telegram could not display a saved product image")
+        await message.reply_text(
+            caption,
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboard,
+            disable_web_page_preview=True,
+        )
+    await message.reply_text(
+        "Manage your saved products:",
+        reply_markup=InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton("🗑 Clear all favourites", callback_data="favorites_clear")],
+                [InlineKeyboardButton("🔎 Find another product", callback_data="find")],
+            ]
+        ),
+    )
+
+
+async def favorites_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await send_favorites(update.effective_message, update.effective_user.id)
+
+
 async def send_live_result(
     message, context: ContextTypes.DEFAULT_TYPE, offset: int = 0
 ) -> None:
@@ -531,6 +748,7 @@ async def send_live_result(
     if offset == 0:
         search.pop("next_offset", None)
         search["displayed_count"] = 0
+        search["result_items"] = {}
         await message.reply_text("🐶 Searching live eBay UK listings…")
     else:
         await message.reply_text("🐶 Fetching three more eBay UK matches…")
@@ -584,9 +802,17 @@ async def send_live_result(
 
     first_shown = int(search.get("displayed_count", 0)) + 1
     for number, item in enumerate(results, first_shown):
+        search.setdefault("result_items", {})[str(number)] = item
+        generation = int(search.get("generation", 0))
         keyboard = InlineKeyboardMarkup(
             [
                 [InlineKeyboardButton("🛒 View deal on eBay", url=item["url"])],
+                [
+                    InlineKeyboardButton(
+                        "❤️ Save favourite",
+                        callback_data=f"favorite_save:{generation}:{number}",
+                    )
+                ],
                 [
                     InlineKeyboardButton("📨 Telegram", url=telegram_share_url(item)),
                     InlineKeyboardButton("💬 WhatsApp", url=whatsapp_share_url(item)),
@@ -650,11 +876,108 @@ async def send_live_result(
 
 async def button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    if query.data not in ("deal_approve", "deal_reject") and not query.data.startswith(
-        "results_more:"
-    ):
+    manual_answer = query.data in ("deal_approve", "deal_reject") or query.data.startswith(
+        ("results_more:", "favorite_save:", "favorite_remove:", "favorites_clear")
+    )
+    if not manual_answer:
         await query.answer()
 
+    if query.data.startswith("favorite_save:"):
+        parts = query.data.split(":")
+        if len(parts) != 3:
+            await query.answer("This save button is invalid.", show_alert=True)
+            return
+        try:
+            generation = int(parts[1])
+            result_number = int(parts[2])
+        except ValueError:
+            await query.answer("This save button is invalid.", show_alert=True)
+            return
+        search = context.user_data.get("search", {})
+        item = search.get("result_items", {}).get(str(result_number))
+        if generation != int(search.get("generation", -1)) or not item:
+            await query.answer(
+                "This result has expired. Run the search again to save it.", show_alert=True
+            )
+            return
+        try:
+            status, _ = await asyncio.to_thread(
+                save_favorite, query.from_user.id, item
+            )
+        except (sqlite3.Error, OSError, ValueError):
+            logger.exception("Could not save favorite")
+            await query.answer("Could not save this favourite right now.", show_alert=True)
+            return
+        if status == "limit":
+            await query.answer(
+                f"You can save up to {MAX_FAVORITES_PER_USER} favourites.",
+                show_alert=True,
+            )
+            return
+        message = "Already saved — details refreshed." if status == "existing" else "Saved to favourites ❤️"
+        await query.answer(message)
+        return
+    if query.data.startswith("favorite_remove:"):
+        parts = query.data.split(":")
+        try:
+            favorite_id = int(parts[1]) if len(parts) == 2 else 0
+        except ValueError:
+            favorite_id = 0
+        if favorite_id <= 0:
+            await query.answer("This remove button is invalid.", show_alert=True)
+            return
+        try:
+            removed = await asyncio.to_thread(
+                delete_favorite, query.from_user.id, favorite_id
+            )
+        except (sqlite3.Error, OSError):
+            logger.exception("Could not remove favorite")
+            await query.answer("Could not remove this favourite right now.", show_alert=True)
+            return
+        if not removed:
+            await query.answer("This favourite was already removed.")
+            return
+        await query.answer("Favourite removed.")
+        try:
+            if query.message.photo:
+                await query.message.edit_caption("🗑 Favourite removed.")
+            else:
+                await query.message.edit_text("🗑 Favourite removed.")
+        except TelegramError:
+            logger.warning("Could not update a removed favorite card")
+        return
+    if query.data == "favorites_clear":
+        await query.answer()
+        await query.message.reply_text(
+            "Delete all your saved favourites? This cannot be undone.",
+            reply_markup=InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "✅ Yes, delete all", callback_data="favorites_clear_confirm"
+                        ),
+                        InlineKeyboardButton(
+                            "❌ Cancel", callback_data="favorites_clear_cancel"
+                        ),
+                    ]
+                ]
+            ),
+        )
+        return
+    if query.data == "favorites_clear_cancel":
+        await query.answer("Cancelled.")
+        await query.edit_message_text("Your saved favourites were not changed.")
+        return
+    if query.data == "favorites_clear_confirm":
+        try:
+            deleted = await asyncio.to_thread(clear_favorites, query.from_user.id)
+        except (sqlite3.Error, OSError):
+            logger.exception("Could not clear favorites")
+            await query.answer("Could not clear favourites right now.", show_alert=True)
+            return
+        await query.answer("Favourites cleared.")
+        await query.edit_message_text(f"🗑 Deleted {deleted} saved favourite(s).")
+        return
     if query.data.startswith("results_more:"):
         parts = query.data.split(":")
         search = context.user_data.get("search", {})
@@ -706,6 +1029,8 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
     elif query.data == "filters_edit":
         await edit_search_filters(query.message, context)
+    elif query.data == "favorites":
+        await send_favorites(query.message, query.from_user.id)
     elif query.data.startswith("budget:"):
         value = query.data.split(":", 1)[1]
         if value == "custom":
@@ -812,6 +1137,10 @@ async def privacy_command(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "can respond and operate requested features. Searches are not sold. Feedback is "
         "forwarded privately to the bot owner and includes your Telegram display name and ID "
         "so a reply is possible.\n\n"
+        "If you save a favourite, DealHound stores your numeric Telegram ID and a snapshot "
+        "of that public product listing in encrypted persistent storage. It does not store "
+        "your Telegram name with favourites. Saved items remain until you remove them or use "
+        "Clear all favourites.\n\n"
         "Do not send passwords, payment-card information, API tokens or other sensitive data. "
         "Price-alert storage will be explained before that feature goes live.",
         parse_mode=ParseMode.HTML,
@@ -879,6 +1208,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "Type a product name — Start searching immediately\n"
         "/find — Guided product search\n"
         "/deals — Latest deals\n"
+        "/favorites — View and remove saved products\n"
+        "/categories — Browse shopping categories\n"
         "/retailers — Retailer connection status\n"
         "/feedback — Send a private suggestion\n"
         "/about — About DealHound\n"
@@ -1088,6 +1419,7 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("find", find_command))
     app.add_handler(CommandHandler("deals", deals_command))
     app.add_handler(CommandHandler("categories", categories_command))
+    app.add_handler(CommandHandler(["favorites", "favourites"], favorites_command))
     app.add_handler(CommandHandler("alerts", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("id", show_id))
@@ -1105,6 +1437,7 @@ def build_application() -> Application:
 
 
 def main() -> None:
+    init_database()
     threading.Thread(target=start_health_server, daemon=True).start()
     logger.info("Starting DealHound UK release %s", RELEASE_LABEL)
     build_application().run_polling(drop_pending_updates=True)
