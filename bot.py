@@ -30,7 +30,7 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger("DealHoundUK")
-RELEASE_LABEL = "one-line-search-1"
+RELEASE_LABEL = "editable-search-filters-1"
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 ADMIN_TELEGRAM_ID = os.getenv("ADMIN_TELEGRAM_ID", "").strip()
@@ -154,6 +154,25 @@ async def begin_product_search(message, context: ContextTypes.DEFAULT_TYPE, quer
     await message.reply_text(
         f"🐶 Searching for: <b>{escape(query)}</b>\n\n"
         "What is your maximum price?",
+        parse_mode=ParseMode.HTML,
+        reply_markup=budget_menu(),
+    )
+
+
+async def edit_search_filters(message, context: ContextTypes.DEFAULT_TYPE) -> None:
+    search = context.user_data.get("search", {})
+    query = search.get("query", "").strip()
+    if not query:
+        context.user_data["flow"] = "search_query"
+        await message.reply_text(
+            "That search has expired. What would you like me to find?"
+        )
+        return
+    context.user_data["flow"] = "search_budget"
+    await message.reply_text(
+        f"⚙️ <b>Change filters</b>\n\n"
+        f"🔎 {escape(query)}\n\n"
+        "Choose a new maximum price:",
         parse_mode=ParseMode.HTML,
         reply_markup=budget_menu(),
     )
@@ -377,7 +396,10 @@ async def send_live_result(message, context: ContextTypes.DEFAULT_TYPE) -> None:
             "I couldn't find a matching eBay UK listing with those filters. "
             "Try a broader search or choose Any condition.",
             reply_markup=InlineKeyboardMarkup(
-                [[InlineKeyboardButton("🔎 Search again", callback_data="find")]]
+                [
+                    [InlineKeyboardButton("⚙️ Change filters", callback_data="filters_edit")],
+                    [InlineKeyboardButton("🔎 New search", callback_data="find")],
+                ]
             ),
         )
         context.user_data.pop("flow", None)
@@ -421,7 +443,10 @@ async def send_live_result(message, context: ContextTypes.DEFAULT_TYPE) -> None:
         "<i>Affiliate links may earn us a commission at no extra cost to you.</i>",
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup(
-            [[InlineKeyboardButton("🔎 Search again", callback_data="find")]]
+            [
+                [InlineKeyboardButton("⚙️ Change filters", callback_data="filters_edit")],
+                [InlineKeyboardButton("🔎 New search", callback_data="find")],
+            ]
         ),
     )
     context.user_data.pop("flow", None)
@@ -439,6 +464,8 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "For example: `Air fryer under £100`",
             parse_mode=ParseMode.MARKDOWN,
         )
+    elif query.data == "filters_edit":
+        await edit_search_filters(query.message, context)
     elif query.data.startswith("budget:"):
         value = query.data.split(":", 1)[1]
         context.user_data.setdefault("search", {})["budget_value"] = (
