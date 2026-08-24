@@ -29,6 +29,7 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger("DealHoundUK")
+RELEASE_LABEL = "ebay-live-search-1"
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 ADMIN_TELEGRAM_ID = os.getenv("ADMIN_TELEGRAM_ID", "").strip()
@@ -768,7 +769,7 @@ def build_application() -> Application:
 
 def main() -> None:
     threading.Thread(target=start_health_server, daemon=True).start()
-    logger.info("Starting DealHound UK")
+    logger.info("Starting DealHound UK release %s", RELEASE_LABEL)
     build_application().run_polling(drop_pending_updates=True)
 
 
