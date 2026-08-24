@@ -15,6 +15,11 @@ The first version provides:
 - Guided searches with maximum-price and condition filters
 - Owner-only `/deal` creator for product links
 - Private deal preview with Publish and Reject buttons
+- Owner-checked Publish and Reject controls
+- `/about`, `/privacy` and `/retailers` information screens
+- Private `/feedback` forwarding to the configured owner
+- Automatic `#Ad` label on deal cards
+- Input length limits and safer public-link validation
 - HTTP health endpoint for Bunny Magic Containers
 - Secure environment-variable configuration
 
