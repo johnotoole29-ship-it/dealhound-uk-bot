@@ -33,7 +33,7 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger("DealHoundUK")
-RELEASE_LABEL = "persistent-favourites-1"
+RELEASE_LABEL = "search-back-button-1"
 DEALS_CHANNEL_URL = "https://t.me/Dealhounduk"
 BOT_PRIVATE_URL = "https://t.me/DealHoundUKBot"
 
@@ -773,6 +773,7 @@ async def send_live_result(
                 [
                     [InlineKeyboardButton("⚙️ Change filters", callback_data="filters_edit")],
                     [InlineKeyboardButton("🔎 New search", callback_data="find")],
+                    [InlineKeyboardButton("⬅️ Back to main menu", callback_data="menu_home")],
                 ]
             ),
         )
@@ -786,6 +787,7 @@ async def send_live_result(
                 [
                     [InlineKeyboardButton("⚙️ Change filters", callback_data="filters_edit")],
                     [InlineKeyboardButton("🔎 New search", callback_data="find")],
+                    [InlineKeyboardButton("⬅️ Back to main menu", callback_data="menu_home")],
                 ]
             ),
         )
@@ -859,6 +861,7 @@ async def send_live_result(
         [
             [InlineKeyboardButton("⚙️ Change filters", callback_data="filters_edit")],
             [InlineKeyboardButton("🔎 New search", callback_data="find")],
+            [InlineKeyboardButton("⬅️ Back to main menu", callback_data="menu_home")],
         ]
     )
     last_shown = first_shown + len(results) - 1
@@ -1020,7 +1023,15 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         finally:
             search["loading_more"] = False
         return
-    if query.data == "find":
+    if query.data == "menu_home":
+        clear_workflow(context)
+        await query.message.reply_text(
+            "🐶 <b>DealHound UK main menu</b>\n\n"
+            "Type a product name or choose an option below:",
+            parse_mode=ParseMode.HTML,
+            reply_markup=main_menu(),
+        )
+    elif query.data == "find":
         context.user_data["flow"] = "search_query"
         await query.message.reply_text(
             "🔎 What would you like me to find?\n\n"
