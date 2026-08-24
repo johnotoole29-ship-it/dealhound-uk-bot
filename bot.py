@@ -14,6 +14,7 @@ from urllib.request import Request, urlopen
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
+from telegram.error import TelegramError
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -29,7 +30,7 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger("DealHoundUK")
-RELEASE_LABEL = "ebay-live-search-1"
+RELEASE_LABEL = "ebay-visual-cards-1"
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 ADMIN_TELEGRAM_ID = os.getenv("ADMIN_TELEGRAM_ID", "").strip()
@@ -279,19 +280,31 @@ def search_ebay(query: str, budget: int | None, condition: str) -> list[dict]:
         price = item.get("price", {})
         if not url or not is_safe_ebay_url(parsed) or price.get("currency") != "GBP":
             continue
+        item_price = float(price["value"])
         shipping = "Check listing"
+        shipping_value = None
         shipping_options = item.get("shippingOptions") or []
         if shipping_options:
             shipping_cost = shipping_options[0].get("shippingCost", {})
             if shipping_cost.get("currency") == "GBP":
                 shipping_value = float(shipping_cost.get("value", 0))
                 shipping = "Free" if shipping_value == 0 else f"£{shipping_value:,.2f}"
+        total = (
+            f"£{item_price + shipping_value:,.2f}"
+            if shipping_value is not None
+            else "Check listing"
+        )
+        image_url = item.get("image", {}).get("imageUrl", "")
+        if not is_safe_ebay_image_url(urlparse(image_url)):
+            image_url = ""
         results.append(
             {
                 "title": str(item.get("title", "eBay listing"))[:180],
-                "price": f"£{float(price['value']):,.2f}",
+                "price": f"£{item_price:,.2f}",
                 "condition": str(item.get("condition", "Not specified"))[:80],
                 "shipping": shipping,
+                "total": total,
+                "image_url": image_url,
                 "url": url,
             }
         )
@@ -303,6 +316,25 @@ def is_safe_ebay_url(parsed) -> bool:
         return False
     host = parsed.hostname.lower().rstrip(".")
     return host == "ebay.co.uk" or host.endswith(".ebay.co.uk")
+
+
+def is_safe_ebay_image_url(parsed) -> bool:
+    if parsed.scheme != "https" or not parsed.hostname:
+        return False
+    host = parsed.hostname.lower().rstrip(".")
+    return host == "ebayimg.com" or host.endswith(".ebayimg.com")
+
+
+def result_card_caption(number: int, item: dict) -> str:
+    return (
+        f"🏷 <b>{number}. {escape(item['title'])}</b>\n\n"
+        f"💷 Item price: <b>{escape(item['price'])}</b>\n"
+        f"🚚 Delivery: {escape(item['shipping'])}\n"
+        f"💰 Total delivered: <b>{escape(item['total'])}</b>\n"
+        f"📦 Condition: {escape(item['condition'])}\n\n"
+        "<i>Check the listing and final price before buying.</i>\n"
+        "#Ad"
+    )
 
 
 async def send_live_result(message, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -335,37 +367,46 @@ async def send_live_result(message, context: ContextTypes.DEFAULT_TYPE) -> None:
         context.user_data.pop("flow", None)
         return
 
-    lines = [
-        "🐶 <b>Live eBay UK matches</b>",
-        f"🔎 {escape(query)}",
-        f"💷 Maximum: <b>{escape(str(budget))}</b>",
-        f"📦 Condition: <b>{escape(condition)}</b>",
-    ]
-    buttons = []
-    for number, item in enumerate(results, 1):
-        lines.extend(
-            [
-                "",
-                f"<b>{number}. {escape(item['title'])}</b>",
-                f"💷 {escape(item['price'])}",
-                f"🚚 Delivery: {escape(item['shipping'])}",
-                f"📦 {escape(item['condition'])}",
-            ]
-        )
-        buttons.append([InlineKeyboardButton(f"View result {number}", url=item["url"])])
-    lines.extend(
-        [
-            "",
-            "<i>Results are supplied by eBay. Check the listing, delivery and final price before buying.</i>",
-            "<i>Affiliate links may earn us a commission at no extra cost to you.</i>",
-        ]
-    )
-    buttons.append([InlineKeyboardButton("🔎 Search again", callback_data="find")])
     await message.reply_text(
-        "\n".join(lines),
+        "🐶 <b>DealHound found these live eBay UK matches</b>\n\n"
+        f"🔎 {escape(query)}\n"
+        f"💷 Maximum: <b>{escape(str(budget))}</b>\n"
+        f"📦 Condition: <b>{escape(condition)}</b>",
         parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup(buttons),
-        disable_web_page_preview=True,
+    )
+
+    for number, item in enumerate(results, 1):
+        keyboard = InlineKeyboardMarkup(
+            [[InlineKeyboardButton("🛒 View deal on eBay", url=item["url"])]]
+        )
+        caption = result_card_caption(number, item)
+        if item["image_url"]:
+            try:
+                await message.reply_photo(
+                    photo=item["image_url"],
+                    caption=caption,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=keyboard,
+                )
+                continue
+            except TelegramError:
+                logger.warning("Telegram could not display an eBay product image")
+        await message.reply_text(
+            caption,
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboard,
+            disable_web_page_preview=True,
+        )
+
+    await message.reply_text(
+        "✅ <b>Search complete</b>\n\n"
+        "Results are supplied by eBay and may include close alternatives. "
+        "Prices and availability can change.\n\n"
+        "<i>Affiliate links may earn us a commission at no extra cost to you.</i>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("🔎 Search again", callback_data="find")]]
+        ),
     )
     context.user_data.pop("flow", None)
 
