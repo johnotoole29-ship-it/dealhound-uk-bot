@@ -30,7 +30,7 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger("DealHoundUK")
-RELEASE_LABEL = "ebay-visual-cards-1"
+RELEASE_LABEL = "one-line-search-1"
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 ADMIN_TELEGRAM_ID = os.getenv("ADMIN_TELEGRAM_ID", "").strip()
@@ -124,7 +124,48 @@ async def show_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
 
 
+def budget_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("£50", callback_data="budget:50"),
+                InlineKeyboardButton("£100", callback_data="budget:100"),
+                InlineKeyboardButton("£250", callback_data="budget:250"),
+            ],
+            [
+                InlineKeyboardButton("£500", callback_data="budget:500"),
+                InlineKeyboardButton("£1,000", callback_data="budget:1000"),
+            ],
+            [InlineKeyboardButton("No maximum", callback_data="budget:any")],
+        ]
+    )
+
+
+async def begin_product_search(message, context: ContextTypes.DEFAULT_TYPE, query: str) -> None:
+    query = query.strip()
+    if not query or len(query) > MAX_SEARCH_LENGTH:
+        context.user_data["flow"] = "search_query"
+        await message.reply_text(
+            f"Please keep searches between 1 and {MAX_SEARCH_LENGTH} characters."
+        )
+        return
+    context.user_data["search"] = {"query": query}
+    context.user_data["flow"] = "search_budget"
+    await message.reply_text(
+        f"🐶 Searching for: <b>{escape(query)}</b>\n\n"
+        "What is your maximum price?",
+        parse_mode=ParseMode.HTML,
+        reply_markup=budget_menu(),
+    )
+
+
 async def find_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    clear_workflow(context)
+    if context.args:
+        await begin_product_search(
+            update.effective_message, context, " ".join(context.args)
+        )
+        return
     context.user_data["flow"] = "search_query"
     await update.effective_message.reply_text(
         "🔎 What would you like me to find?\n\n"
@@ -171,33 +212,8 @@ async def demo_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         )
         return
 
-    query = update.effective_message.text.strip()
-    if not query or len(query) > MAX_SEARCH_LENGTH:
-        await update.effective_message.reply_text(
-            f"Please keep searches between 1 and {MAX_SEARCH_LENGTH} characters."
-        )
-        return
-    context.user_data["search"] = {"query": query}
-    context.user_data["flow"] = "search_budget"
-    keyboard = InlineKeyboardMarkup(
-        [
-            [
-                InlineKeyboardButton("£50", callback_data="budget:50"),
-                InlineKeyboardButton("£100", callback_data="budget:100"),
-                InlineKeyboardButton("£250", callback_data="budget:250"),
-            ],
-            [
-                InlineKeyboardButton("£500", callback_data="budget:500"),
-                InlineKeyboardButton("£1,000", callback_data="budget:1000"),
-            ],
-            [InlineKeyboardButton("No maximum", callback_data="budget:any")],
-        ]
-    )
-    await update.effective_message.reply_text(
-        f"🐶 Searching for: <b>{escape(query)}</b>\n\n"
-        "What is your maximum price?",
-        parse_mode=ParseMode.HTML,
-        reply_markup=keyboard,
+    await begin_product_search(
+        update.effective_message, context, update.effective_message.text
     )
 
 
