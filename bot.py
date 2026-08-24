@@ -31,7 +31,7 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger("DealHoundUK")
-RELEASE_LABEL = "direct-text-search-1"
+RELEASE_LABEL = "shareable-deal-cards-1"
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 ADMIN_TELEGRAM_ID = os.getenv("ADMIN_TELEGRAM_ID", "").strip()
@@ -426,6 +426,20 @@ def result_card_caption(number: int, item: dict) -> str:
     )
 
 
+def deal_share_url(item: dict) -> str:
+    share_text = (
+        f"🐶 DealHound UK find\n\n"
+        f"{item['title'][:120]}\n"
+        f"Item price: {item['price']}\n"
+        f"Delivery: {item['shipping']}\n"
+        f"Total delivered: {item['total']}\n\n"
+        "Check the listing and final price before buying. #Ad"
+    )
+    return "https://t.me/share/url?" + urlencode(
+        {"url": item["url"], "text": share_text}
+    )
+
+
 async def send_live_result(message, context: ContextTypes.DEFAULT_TYPE) -> None:
     search = context.user_data.get("search", {})
     query = search.get("query", "product")
@@ -469,7 +483,10 @@ async def send_live_result(message, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     for number, item in enumerate(results, 1):
         keyboard = InlineKeyboardMarkup(
-            [[InlineKeyboardButton("🛒 View deal on eBay", url=item["url"])]]
+            [
+                [InlineKeyboardButton("🛒 View deal on eBay", url=item["url"])],
+                [InlineKeyboardButton("📤 Share deal", url=deal_share_url(item))],
+            ]
         )
         caption = result_card_caption(number, item)
         if item["image_url"]:
