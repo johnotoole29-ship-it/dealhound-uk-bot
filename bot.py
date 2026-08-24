@@ -31,7 +31,7 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger("DealHoundUK")
-RELEASE_LABEL = "shareable-deal-cards-1"
+RELEASE_LABEL = "multi-app-deal-sharing-1"
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 ADMIN_TELEGRAM_ID = os.getenv("ADMIN_TELEGRAM_ID", "").strip()
@@ -426,8 +426,8 @@ def result_card_caption(number: int, item: dict) -> str:
     )
 
 
-def deal_share_url(item: dict) -> str:
-    share_text = (
+def deal_share_text(item: dict) -> str:
+    return (
         f"🐶 DealHound UK find\n\n"
         f"{item['title'][:120]}\n"
         f"Item price: {item['price']}\n"
@@ -435,8 +435,17 @@ def deal_share_url(item: dict) -> str:
         f"Total delivered: {item['total']}\n\n"
         "Check the listing and final price before buying. #Ad"
     )
+
+
+def telegram_share_url(item: dict) -> str:
     return "https://t.me/share/url?" + urlencode(
-        {"url": item["url"], "text": share_text}
+        {"url": item["url"], "text": deal_share_text(item)}
+    )
+
+
+def whatsapp_share_url(item: dict) -> str:
+    return "https://wa.me/?" + urlencode(
+        {"text": f"{deal_share_text(item)}\n\n{item['url']}"}
     )
 
 
@@ -485,7 +494,10 @@ async def send_live_result(message, context: ContextTypes.DEFAULT_TYPE) -> None:
         keyboard = InlineKeyboardMarkup(
             [
                 [InlineKeyboardButton("🛒 View deal on eBay", url=item["url"])],
-                [InlineKeyboardButton("📤 Share deal", url=deal_share_url(item))],
+                [
+                    InlineKeyboardButton("📨 Telegram", url=telegram_share_url(item)),
+                    InlineKeyboardButton("💬 WhatsApp", url=whatsapp_share_url(item)),
+                ],
             ]
         )
         caption = result_card_caption(number, item)
