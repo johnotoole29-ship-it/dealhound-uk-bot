@@ -31,7 +31,7 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger("DealHoundUK")
-RELEASE_LABEL = "interactive-categories-1"
+RELEASE_LABEL = "buy-it-now-results-1"
 DEALS_CHANNEL_URL = "https://t.me/Dealhounduk"
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
@@ -399,7 +399,7 @@ def search_ebay(
     if not EBAY_CAMPAIGN_ID.isdigit() or len(EBAY_CAMPAIGN_ID) != 10:
         raise RuntimeError("eBay campaign ID is not configured correctly")
 
-    filters = []
+    filters = ["buyingOptions:{FIXED_PRICE}"]
     if budget is not None:
         filters.extend([f"price:[..{budget}]", "priceCurrency:GBP"])
     condition_filter = {
@@ -491,6 +491,7 @@ def result_card_caption(number: int, item: dict) -> str:
         f"🚚 Delivery: {escape(item['shipping'])}\n"
         f"💰 Total delivered: <b>{escape(item['total'])}</b>\n"
         f"📦 Condition: {escape(item['condition'])}\n\n"
+        "🛒 Buy It Now listing\n\n"
         "<i>Check the listing and final price before buying.</i>\n"
         "#Ad"
     )
@@ -503,6 +504,7 @@ def deal_share_text(item: dict) -> str:
         f"Item price: {item['price']}\n"
         f"Delivery: {item['shipping']}\n"
         f"Total delivered: {item['total']}\n\n"
+        "Buy It Now listing\n\n"
         "Check the listing and final price before buying. #Ad"
     )
 
