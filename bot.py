@@ -8,6 +8,7 @@ import time
 from html import escape
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from ipaddress import ip_address
+from math import isfinite
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urlparse
 from urllib.request import Request, urlopen
@@ -30,7 +31,7 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger("DealHoundUK")
-RELEASE_LABEL = "editable-search-filters-1"
+RELEASE_LABEL = "custom-search-budget-1"
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 ADMIN_TELEGRAM_ID = os.getenv("ADMIN_TELEGRAM_ID", "").strip()
@@ -43,6 +44,7 @@ PORT = int(os.getenv("PORT", "8080"))
 MAX_SEARCH_LENGTH = 200
 MAX_TITLE_LENGTH = 180
 MAX_FEEDBACK_LENGTH = 1000
+MAX_CUSTOM_BUDGET = 1_000_000
 EBAY_TIMEOUT_SECONDS = 12
 EBAY_RESULT_LIMIT = 3
 
@@ -136,9 +138,37 @@ def budget_menu() -> InlineKeyboardMarkup:
                 InlineKeyboardButton("£500", callback_data="budget:500"),
                 InlineKeyboardButton("£1,000", callback_data="budget:1000"),
             ],
+            [InlineKeyboardButton("✏️ Enter your own amount", callback_data="budget:custom")],
             [InlineKeyboardButton("No maximum", callback_data="budget:any")],
         ]
     )
+
+
+def condition_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("New", callback_data="condition:new"),
+                InlineKeyboardButton("Refurbished", callback_data="condition:refurbished"),
+            ],
+            [
+                InlineKeyboardButton("Used", callback_data="condition:used"),
+                InlineKeyboardButton("Any", callback_data="condition:any"),
+            ],
+        ]
+    )
+
+
+def parse_custom_budget(value: str) -> tuple[float, str] | None:
+    cleaned = value.strip().replace("£", "").replace(",", "")
+    try:
+        amount = float(cleaned)
+    except ValueError:
+        return None
+    if not isfinite(amount) or amount <= 0 or amount > MAX_CUSTOM_BUDGET:
+        return None
+    label = f"£{amount:,.2f}".removesuffix(".00")
+    return amount, label
 
 
 async def begin_product_search(message, context: ContextTypes.DEFAULT_TYPE, query: str) -> None:
@@ -221,6 +251,22 @@ async def demo_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     if flow == "feedback":
         await receive_feedback(update, context)
+        return
+    if flow == "search_custom_budget":
+        parsed_budget = parse_custom_budget(update.effective_message.text)
+        if not parsed_budget:
+            await update.effective_message.reply_text(
+                "Enter a valid maximum price, for example `750` or `£1,250`. ",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
+        amount, label = parsed_budget
+        context.user_data.setdefault("search", {})["budget_value"] = amount
+        context.user_data.setdefault("search", {})["budget"] = label
+        context.user_data["flow"] = "search_condition"
+        await update.effective_message.reply_text(
+            "Which condition?", reply_markup=condition_menu()
+        )
         return
 
     if flow != "search_query":
@@ -468,6 +514,13 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await edit_search_filters(query.message, context)
     elif query.data.startswith("budget:"):
         value = query.data.split(":", 1)[1]
+        if value == "custom":
+            context.user_data["flow"] = "search_custom_budget"
+            await query.message.reply_text(
+                "✏️ Enter your maximum price.\n\nFor example: `750` or `£1,250`",
+                parse_mode=ParseMode.MARKDOWN,
+            )
+            return
         context.user_data.setdefault("search", {})["budget_value"] = (
             None if value == "any" else int(value)
         )
@@ -475,19 +528,7 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             "No maximum" if value == "any" else f"£{int(value):,}"
         )
         context.user_data["flow"] = "search_condition"
-        keyboard = InlineKeyboardMarkup(
-            [
-                [
-                    InlineKeyboardButton("New", callback_data="condition:new"),
-                    InlineKeyboardButton("Refurbished", callback_data="condition:refurbished"),
-                ],
-                [
-                    InlineKeyboardButton("Used", callback_data="condition:used"),
-                    InlineKeyboardButton("Any", callback_data="condition:any"),
-                ],
-            ]
-        )
-        await query.message.reply_text("Which condition?", reply_markup=keyboard)
+        await query.message.reply_text("Which condition?", reply_markup=condition_menu())
     elif query.data.startswith("condition:"):
         value = query.data.split(":", 1)[1]
         context.user_data.setdefault("search", {})["condition"] = value.title()
