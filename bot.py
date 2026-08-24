@@ -3,6 +3,7 @@ import os
 import threading
 from html import escape
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from ipaddress import ip_address
 from urllib.parse import urlparse
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -27,6 +28,20 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 ADMIN_TELEGRAM_ID = os.getenv("ADMIN_TELEGRAM_ID", "").strip()
 DEALS_CHANNEL_ID = os.getenv("DEALS_CHANNEL_ID", "").strip()
 PORT = int(os.getenv("PORT", "8080"))
+
+MAX_SEARCH_LENGTH = 200
+MAX_TITLE_LENGTH = 180
+MAX_FEEDBACK_LENGTH = 1000
+
+RETAILER_STATUSES = [
+    ("Currys", "🟠 Pending approval"),
+    ("AO.com", "🟠 Pending approval"),
+    ("Very", "🟠 Pending approval"),
+    ("The Range", "🟠 Pending approval"),
+    ("Marks & Spencer", "🟠 Pending approval"),
+    ("eBay UK", "🟠 Developer approval pending"),
+    ("Amazon UK", "⚪ Coming later"),
+]
 
 
 class HealthHandler(BaseHTTPRequestHandler):
@@ -62,12 +77,16 @@ def main_menu() -> InlineKeyboardMarkup:
                 InlineKeyboardButton("⏰ Price alerts", callback_data="alerts"),
                 InlineKeyboardButton("ℹ️ Help", callback_data="help"),
             ],
+            [
+                InlineKeyboardButton("🏪 Retailers", callback_data="retailers"),
+                InlineKeyboardButton("💬 Feedback", callback_data="feedback"),
+            ],
         ]
     )
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    context.user_data.pop("awaiting_search", None)
+    clear_workflow(context)
     text = (
         "🐶 *Welcome to DealHound UK!*\n\n"
         "I sniff out great UK prices from leading retailers.\n\n"
@@ -104,7 +123,13 @@ async def demo_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await receive_deal_url(update, context)
         return
     if flow == "deal_title":
-        context.user_data["deal"]["title"] = update.effective_message.text.strip()
+        title = update.effective_message.text.strip()
+        if not title or len(title) > MAX_TITLE_LENGTH:
+            await update.effective_message.reply_text(
+                f"Please enter a product title between 1 and {MAX_TITLE_LENGTH} characters."
+            )
+            return
+        context.user_data["deal"]["title"] = title
         context.user_data["flow"] = "deal_price"
         await update.effective_message.reply_text(
             "💷 What is the current price?\n\nExample: `449.00`",
@@ -117,6 +142,9 @@ async def demo_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if flow == "deal_old_price":
         await receive_deal_old_price(update, context)
         return
+    if flow == "feedback":
+        await receive_feedback(update, context)
+        return
 
     if flow != "search_query":
         await update.effective_message.reply_text(
@@ -127,6 +155,11 @@ async def demo_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     query = update.effective_message.text.strip()
+    if not query or len(query) > MAX_SEARCH_LENGTH:
+        await update.effective_message.reply_text(
+            f"Please keep searches between 1 and {MAX_SEARCH_LENGTH} characters."
+        )
+        return
     context.user_data["search"] = {"query": query}
     context.user_data["flow"] = "search_budget"
     keyboard = InlineKeyboardMarkup(
@@ -144,9 +177,9 @@ async def demo_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         ]
     )
     await update.effective_message.reply_text(
-        f"🐶 Searching for: *{escape_markdown(query)}*\n\n"
+        f"🐶 Searching for: <b>{escape(query)}</b>\n\n"
         "What is your maximum price?",
-        parse_mode=ParseMode.MARKDOWN,
+        parse_mode=ParseMode.HTML,
         reply_markup=keyboard,
     )
 
@@ -164,31 +197,28 @@ async def send_demo_result(message, context: ContextTypes.DEFAULT_TYPE) -> None:
         ]
     )
     await message.reply_text(
-        "🐶 *DealHound searched for:*\n"
-        f"`{escape_markdown(query)}`\n\n"
-        f"💷 Maximum: *{escape_markdown(str(budget))}*\n"
-        f"📦 Condition: *{escape_markdown(condition)}*\n\n"
-        "🏷 *Example matching result*\n"
+        "🐶 <b>DealHound searched for:</b>\n"
+        f"{escape(query)}\n\n"
+        f"💷 Maximum: <b>{escape(str(budget))}</b>\n"
+        f"📦 Condition: <b>{escape(condition)}</b>\n\n"
+        "🏷 <b>Example matching result</b>\n"
         "💷 £449.00\n"
         "🏪 eBay UK\n"
         "📦 Condition: New\n\n"
-        "_Demo result — live retailer prices will appear when the eBay "
-        "developer account is connected._\n\n"
-        "_Affiliate links may earn us a commission at no extra cost to you._",
-        parse_mode=ParseMode.MARKDOWN,
+        "<i>Demo result — live retailer prices will appear when the eBay "
+        "developer account is connected.</i>\n\n"
+        "<i>Affiliate links may earn us a commission at no extra cost to you.</i>",
+        parse_mode=ParseMode.HTML,
         reply_markup=keyboard,
         disable_web_page_preview=True,
     )
     context.user_data.pop("flow", None)
 
 
-def escape_markdown(value: str) -> str:
-    return value.replace("`", "'")
-
-
 async def button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    await query.answer()
+    if query.data not in ("deal_approve", "deal_reject"):
+        await query.answer()
 
     if query.data == "find":
         context.user_data["flow"] = "search_query"
@@ -223,6 +253,10 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     elif query.data == "deal_approve":
         await approve_deal(query, context)
     elif query.data == "deal_reject":
+        if not is_admin(query.from_user.id):
+            await query.answer("Owner only", show_alert=True)
+            return
+        await query.answer()
         context.user_data.pop("deal", None)
         context.user_data.pop("flow", None)
         await query.edit_message_text("❌ Deal rejected. Nothing was published.")
@@ -246,6 +280,14 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await query.message.reply_text(
             "✅ The alert screen works. Saving live alerts is coming in the retailer phase."
         )
+    elif query.data == "retailers":
+        await send_retailers(query.message)
+    elif query.data == "feedback":
+        context.user_data["flow"] = "feedback"
+        await query.message.reply_text(
+            "💬 Send your suggestion or feedback in one message.\n\n"
+            "It will be forwarded privately to the DealHound owner. Use /cancel to stop."
+        )
     else:
         await help_command(update, context)
 
@@ -264,6 +306,82 @@ async def disclosure(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     )
 
 
+async def about_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.effective_message.reply_text(
+        "🐶 <b>About DealHound UK</b>\n\n"
+        "DealHound is a UK shopping assistant being built to compare matching products "
+        "across approved retailers, highlight total prices and provide price alerts.\n\n"
+        "Retailer integrations are being activated one at a time after approval and testing.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def privacy_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.effective_message.reply_text(
+        "🔐 <b>DealHound Privacy</b>\n\n"
+        "DealHound receives your Telegram user ID and the messages you send to the bot so it "
+        "can respond and operate requested features. Searches are not sold. Feedback is "
+        "forwarded privately to the bot owner and includes your Telegram display name and ID "
+        "so a reply is possible.\n\n"
+        "Do not send passwords, payment-card information, API tokens or other sensitive data. "
+        "Price-alert storage will be explained before that feature goes live.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+def retailer_status_text() -> str:
+    rows = "\n".join(f"{status} — {escape(name)}" for name, status in RETAILER_STATUSES)
+    return (
+        "🏪 <b>Retailer status</b>\n\n"
+        f"{rows}\n\n"
+        "Only retailers marked 🟢 Live will appear in real comparisons."
+    )
+
+
+async def send_retailers(message) -> None:
+    await message.reply_text(retailer_status_text(), parse_mode=ParseMode.HTML)
+
+
+async def retailers_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await send_retailers(update.effective_message)
+
+
+async def feedback_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data["flow"] = "feedback"
+    await update.effective_message.reply_text(
+        "💬 Send your suggestion or feedback in one message.\n\n"
+        "It will be forwarded privately to the DealHound owner. Use /cancel to stop."
+    )
+
+
+async def receive_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    value = update.effective_message.text.strip()
+    if not value or len(value) > MAX_FEEDBACK_LENGTH:
+        await update.effective_message.reply_text(
+            f"Please keep feedback between 1 and {MAX_FEEDBACK_LENGTH} characters."
+        )
+        return
+    if not ADMIN_TELEGRAM_ID:
+        context.user_data.pop("flow", None)
+        await update.effective_message.reply_text("Feedback is temporarily unavailable.")
+        return
+    user = update.effective_user
+    sender = escape(user.full_name or "Unknown user")
+    username = f"@{escape(user.username)}" if user.username else "No username"
+    await context.bot.send_message(
+        chat_id=ADMIN_TELEGRAM_ID,
+        text=(
+            "💬 <b>DealHound feedback</b>\n\n"
+            f"From: {sender} ({username})\n"
+            f"Telegram ID: <code>{user.id}</code>\n\n"
+            f"{escape(value)}"
+        ),
+        parse_mode=ParseMode.HTML,
+    )
+    context.user_data.pop("flow", None)
+    await update.effective_message.reply_text("✅ Thank you. Your feedback was sent privately.")
+
+
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     await message.reply_text(
@@ -271,6 +389,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/start — Main menu\n"
         "/find — Search for a product\n"
         "/deals — Latest deals\n"
+        "/retailers — Retailer connection status\n"
+        "/feedback — Send a private suggestion\n"
+        "/about — About DealHound\n"
+        "/privacy — Privacy information\n"
         "/id — Show your Telegram ID\n"
         "/disclosure — Affiliate information",
         parse_mode=ParseMode.MARKDOWN,
@@ -319,18 +441,23 @@ async def deal_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 
 async def cancel_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    clear_workflow(context)
+    await update.effective_message.reply_text("Cancelled.", reply_markup=main_menu())
+
+
+def clear_workflow(context: ContextTypes.DEFAULT_TYPE) -> None:
+    context.user_data.pop("awaiting_search", None)
     context.user_data.pop("deal", None)
     context.user_data.pop("search", None)
     context.user_data.pop("flow", None)
-    await update.effective_message.reply_text("Cancelled.", reply_markup=main_menu())
 
 
 async def receive_deal_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     url = update.effective_message.text.strip()
     parsed = urlparse(url)
-    if parsed.scheme not in ("http", "https") or not parsed.netloc:
+    if not is_safe_public_url(parsed):
         await update.effective_message.reply_text(
-            "That does not look like a complete URL. Please paste a link beginning with `https://`.",
+            "Please paste a complete public retailer link beginning with `https://`.",
             parse_mode=ParseMode.MARKDOWN,
         )
         return
@@ -340,6 +467,19 @@ async def receive_deal_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     }
     context.user_data["flow"] = "deal_title"
     await update.effective_message.reply_text("🏷 Send the product title.")
+
+
+def is_safe_public_url(parsed) -> bool:
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        return False
+    host = parsed.hostname.lower()
+    if host == "localhost" or host.endswith(".local") or parsed.username or parsed.password:
+        return False
+    try:
+        address = ip_address(host)
+    except ValueError:
+        return True
+    return address.is_global
 
 
 def retailer_name(host: str) -> str:
@@ -402,7 +542,8 @@ def deal_card(deal: dict, preview: bool = False) -> str:
         f"🏪 {escape(deal['retailer'])}\n"
         "🚚 Check delivery and final price with the retailer\n\n"
         "<i>Affiliate link: we may earn a commission at no extra cost to you. "
-        "Prices can change; verify before purchasing.</i>"
+        "Prices can change; verify before purchasing.</i>\n\n"
+        "#Ad"
     )
 
 
@@ -426,6 +567,7 @@ async def approve_deal(query, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not is_admin(query.from_user.id):
         await query.answer("Owner only", show_alert=True)
         return
+    await query.answer()
     deal = context.user_data.get("deal")
     if not deal:
         await query.edit_message_text("This preview has expired. Start again with /deal.")
@@ -460,6 +602,10 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("id", show_id))
     app.add_handler(CommandHandler("disclosure", disclosure))
+    app.add_handler(CommandHandler("about", about_command))
+    app.add_handler(CommandHandler("privacy", privacy_command))
+    app.add_handler(CommandHandler("retailers", retailers_command))
+    app.add_handler(CommandHandler("feedback", feedback_command))
     app.add_handler(CommandHandler("testdeal", test_deal))
     app.add_handler(CommandHandler("deal", deal_command))
     app.add_handler(CommandHandler("cancel", cancel_command))
