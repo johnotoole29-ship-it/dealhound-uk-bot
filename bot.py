@@ -31,7 +31,7 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger("DealHoundUK")
-RELEASE_LABEL = "custom-search-budget-1"
+RELEASE_LABEL = "direct-text-search-1"
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
 ADMIN_TELEGRAM_ID = os.getenv("ADMIN_TELEGRAM_ID", "").strip()
@@ -109,9 +109,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
         "🐶 *Welcome to DealHound UK!*\n\n"
         "I sniff out great UK prices from leading retailers.\n\n"
-        "🔎 Search for a product\n"
+        "💬 Simply type a product name to begin\n"
+        "🔎 Or tap Find a product for guidance\n"
         "🔥 Discover fresh deals\n"
         "⏰ Watch for price drops\n\n"
+        "Try: `LEGO Millennium Falcon`\n\n"
         "Choose an option below:"
     )
     await update.effective_message.reply_text(
@@ -266,6 +268,12 @@ async def demo_search(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         context.user_data["flow"] = "search_condition"
         await update.effective_message.reply_text(
             "Which condition?", reply_markup=condition_menu()
+        )
+        return
+
+    if flow is None:
+        await begin_product_search(
+            update.effective_message, context, update.effective_message.text
         )
         return
 
@@ -670,7 +678,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await message.reply_text(
         "ℹ️ *DealHound Help*\n\n"
         "/start — Main menu\n"
-        "/find — Search for a product\n"
+        "Type a product name — Start searching immediately\n"
+        "/find — Guided product search\n"
         "/deals — Latest deals\n"
         "/retailers — Retailer connection status\n"
         "/feedback — Send a private suggestion\n"
