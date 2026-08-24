@@ -31,7 +31,7 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger("DealHoundUK")
-RELEASE_LABEL = "live-deals-channel-1"
+RELEASE_LABEL = "interactive-categories-1"
 DEALS_CHANNEL_URL = "https://t.me/Dealhounduk"
 
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
@@ -64,6 +64,17 @@ RETAILER_STATUSES = [
     ("eBay UK", "🟢 Live search"),
     ("Amazon UK", "⚪ Coming later"),
 ]
+
+CATEGORY_SEARCHES = {
+    "tvs": ("📺 TVs", "4K Smart TV"),
+    "laptops": ("💻 Laptops", "laptop"),
+    "phones": ("📱 Phones", "smartphone"),
+    "gaming": ("🎮 Gaming", "gaming console"),
+    "lego": ("🧱 LEGO & Toys", "LEGO set"),
+    "kitchen": ("🍳 Kitchen", "kitchen appliance"),
+    "home": ("🏠 Home & Garden", "home and garden"),
+    "beauty": ("💄 Health & Beauty", "health and beauty"),
+}
 
 
 class HealthHandler(BaseHTTPRequestHandler):
@@ -111,6 +122,43 @@ def deals_channel_button() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [[InlineKeyboardButton("🔥 Open DealHound UK deals", url=DEALS_CHANNEL_URL)]]
     )
+
+
+def categories_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton("📺 TVs", callback_data="category:tvs"),
+                InlineKeyboardButton("💻 Laptops", callback_data="category:laptops"),
+            ],
+            [
+                InlineKeyboardButton("📱 Phones", callback_data="category:phones"),
+                InlineKeyboardButton("🎮 Gaming", callback_data="category:gaming"),
+            ],
+            [
+                InlineKeyboardButton("🧱 LEGO & Toys", callback_data="category:lego"),
+                InlineKeyboardButton("🍳 Kitchen", callback_data="category:kitchen"),
+            ],
+            [
+                InlineKeyboardButton("🏠 Home & Garden", callback_data="category:home"),
+                InlineKeyboardButton("💄 Health & Beauty", callback_data="category:beauty"),
+            ],
+            [InlineKeyboardButton("🔎 Search for something else", callback_data="find")],
+        ]
+    )
+
+
+async def send_categories(message) -> None:
+    await message.reply_text(
+        "🛍 <b>Browse categories</b>\n\n"
+        "Choose a category, then set your maximum price and preferred condition.",
+        parse_mode=ParseMode.HTML,
+        reply_markup=categories_menu(),
+    )
+
+
+async def categories_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await send_categories(update.effective_message)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -695,10 +743,18 @@ async def button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             reply_markup=deals_channel_button(),
         )
     elif query.data == "categories":
-        await query.message.reply_text(
-            "🛍 *Categories*\n\n📺 TVs\n💻 Computing\n🎮 Gaming\n🍳 Kitchen\n📱 Phones",
-            parse_mode=ParseMode.MARKDOWN,
-        )
+        await send_categories(query.message)
+    elif query.data.startswith("category:"):
+        slug = query.data.split(":", 1)[1]
+        category = CATEGORY_SEARCHES.get(slug)
+        if not category:
+            await query.message.reply_text(
+                "That category is unavailable. Please choose another.",
+                reply_markup=categories_menu(),
+            )
+            return
+        clear_workflow(context)
+        await begin_product_search(query.message, context, category[1])
     elif query.data == "alerts":
         await query.message.reply_text(
             "⏰ *Price alerts*\n\nPrice alerts will activate after live retailer prices are connected.",
@@ -1029,7 +1085,7 @@ def build_application() -> Application:
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("find", find_command))
     app.add_handler(CommandHandler("deals", deals_command))
-    app.add_handler(CommandHandler("categories", start))
+    app.add_handler(CommandHandler("categories", categories_command))
     app.add_handler(CommandHandler("alerts", start))
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("id", show_id))
